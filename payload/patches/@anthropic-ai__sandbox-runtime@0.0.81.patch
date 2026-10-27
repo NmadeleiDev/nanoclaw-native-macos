@@ -1,0 +1,810 @@
+diff --git a/dist/sandbox/macos-sandbox-utils.js b/dist/sandbox/macos-sandbox-utils.js
+index 0e598b612d84d24b09ec2ab0d7ccc9b009c9457b..f3d009c0a6b65fd42e6af5c231afa55b20146e17 100644
+--- a/dist/sandbox/macos-sandbox-utils.js
++++ b/dist/sandbox/macos-sandbox-utils.js
+@@ -750,7 +750,7 @@ function generateWriteRules(config, logTag, allowGitConfig, writeRoots) {
+ /**
+  * Generate complete sandbox profile
+  */
+-function generateSandboxProfile({ readConfig, libraryDenyEntries, writeConfig, httpProxyPort, socksProxyPort, needsNetworkRestriction, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, allowPty, allowGitConfig = false, enableWeakerNetworkIsolation = false, allowAppleEvents = false, logTag, }) {
++function generateSandboxProfile({ readConfig, libraryDenyEntries, writeConfig, httpProxyPort, socksProxyPort, needsNetworkRestriction, allowUnixSockets, allowAllUnixSockets, allowOutboundInternet, localConnectPorts, listenPorts, allowLocalBinding, allowMachLookup, allowPty, allowGitConfig = false, enableWeakerNetworkIsolation = false, allowAppleEvents = false, logTag, }) {
+     const profile = [
+         '(version 1)',
+         `(deny default (with message "${logTag}"))`,
+@@ -835,6 +835,7 @@ function generateSandboxProfile({ readConfig, libraryDenyEntries, writeConfig, h
+         '',
+         '; sysctl - specific sysctls only',
+         '(allow sysctl-read',
++        '  (sysctl-name "kern.hv_vmm_present")',
+         '  (sysctl-name "hw.activecpu")',
+         '  (sysctl-name "hw.busfrequency_compat")',
+         '  (sysctl-name "hw.byteorder")',
+@@ -948,6 +949,17 @@ function generateSandboxProfile({ readConfig, libraryDenyEntries, writeConfig, h
+         // "localhost:*") matches connect() to 127.0.0.1 and ::1 but not
+         // ::ffff:127.0.0.1; runtimes that connect to loopback via dual-stack
+         // sockets need to use AF_INET (see JAVA_TOOL_OPTIONS injection below).
++        // NanoClaw: open IP egress does not grant listening or Unix sockets.
++        if (allowOutboundInternet) profile.push('(allow network-outbound (remote ip "*:*"))');
++        // NanoClaw: independently grant outbound local ports and listening ports.
++        // macOS local-ip filters do not guarantee loopback-only listeners.
++        for (const port of localConnectPorts ?? []) {
++            profile.push(`(allow network-outbound (remote ip "localhost:${port}"))`);
++        }
++        for (const port of listenPorts ?? []) {
++            profile.push(`(allow network-bind (local ip "localhost:${port}"))`);
++            profile.push(`(allow network-inbound (local ip "localhost:${port}"))`);
++        }
+         if (allowLocalBinding) {
+             profile.push('(allow network-bind (local ip "*:*"))');
+             profile.push('(allow network-inbound (local ip "*:*"))');
+@@ -1044,7 +1056,7 @@ function escapePath(pathStr) {
+  * Wrap command with macOS sandbox
+  */
+ export function wrapCommandWithSandboxMacOS(params) {
+-    const { command, commandId, needsNetworkRestriction, httpProxyPort, socksProxyPort, proxyAuthToken, caCertPath, javaAgentJarPath, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, readConfig, writeConfig, unsetEnvVars, setEnvVars, maskedFileBinds, degradeToDenyPaths, allowPty, allowGitConfig = false, gitSafeDirectories, enableWeakerNetworkIsolation = false, allowAppleEvents = false, binShell, } = params;
++    const { command, commandId, needsNetworkRestriction, httpProxyPort, socksProxyPort, proxyAuthToken, caCertPath, javaAgentJarPath, allowUnixSockets, allowAllUnixSockets, allowOutboundInternet, localConnectPorts, listenPorts, allowLocalBinding, allowMachLookup, readConfig, writeConfig, unsetEnvVars, setEnvVars, maskedFileBinds, degradeToDenyPaths, allowPty, allowGitConfig = false, gitSafeDirectories, enableWeakerNetworkIsolation = false, allowAppleEvents = false, binShell, } = params;
+     // SBPL cannot redirect a read to different bytes, so whole-file masking
+     // degrades to read-deny on macOS: the sandboxed process gets EPERM
+     // instead of the sentinel. The DYLD interposer (a later step) lifts
+@@ -1095,6 +1107,9 @@ export function wrapCommandWithSandboxMacOS(params) {
+         needsNetworkRestriction,
+         allowUnixSockets,
+         allowAllUnixSockets,
++        allowOutboundInternet,
++        localConnectPorts,
++        listenPorts,
+         allowLocalBinding,
+         allowMachLookup,
+         allowPty,
+diff --git a/dist/sandbox/mitm-ca.js b/dist/sandbox/mitm-ca.js
+index b571202a82dbe5ab34703c93baf1d745613d9728..6409d4342b441e8deb6d757b8b4d960905db619d 100644
+--- a/dist/sandbox/mitm-ca.js
++++ b/dist/sandbox/mitm-ca.js
+@@ -1,464 +1,14 @@
+-/**
+- * MITM CA loader/generator for the in-process TLS-terminating proxy.
+- *
+- * The CA is supplied via `network.tlsTerminate.{caCertPath,caKeyPath}` (see
+- * sandbox-config.ts). If both paths are omitted, SRT generates an ephemeral
+- * RSA-2048 self-signed CA into a temp directory; the cert path is what the
+- * trust env vars point at. The caller is responsible for cleaning up via
+- * `disposeMitmCA()` (SandboxManager.reset() does this).
+- */
+-import forge from 'node-forge';
+-import { sign as cryptoSign, X509Certificate } from 'node:crypto';
+-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+-import { rm } from 'node:fs/promises';
+-import { tmpdir } from 'node:os';
+-import { join, dirname } from 'node:path';
+-import { rootCertificates } from 'node:tls';
+-import { logForDebugging } from '../utils/debug.js';
+-const { asn1, pki, md, random, util } = forge;
+-// node-forge exports pki.getTBSCertificate at runtime; @types/node-forge omits it.
+-const getTBSCertificate = pki.getTBSCertificate;
+-/**
+- * Matches one PEM CERTIFICATE block. Used to extract just the certificates
+- * out of files listed in tlsTerminate.extraCaCertPaths before they are
+- * copied into the (world-readable) trust bundle.
+- */
+-const PEM_CERT_BLOCK = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+-/** Origin-form path the HTTP proxy answers with `crlDer`. */
+-export const CRL_PATH = '/srt.crl';
+-/**
+- * Return the CA's Subject Key Identifier as raw bytes for use as an
+- * authorityKeyIdentifier.keyIdentifier (leaf certs and the CRL both need it).
+- *
+- * node-forge stores a cert's subjectKeyIdentifier extension value as a *hex
+- * string* (both for in-memory certs and certs parsed from PEM), but expects
+- * AKI's keyIdentifier as *raw bytes* — passing the hex through verbatim
+- * encodes the ASCII hex chars as the key id and the chain fails to verify.
+- * If the CA has no SKI extension (e.g. a v1 user-supplied CA), derive the
+- * RFC 5280 method-1 value from its public key.
+- */
+-export function caSubjectKeyId(caCert) {
+-    const ext = caCert.getExtension('subjectKeyIdentifier');
+-    return ext?.subjectKeyIdentifier
+-        ? util.hexToBytes(ext.subjectKeyIdentifier)
+-        : caCert.generateSubjectKeyIdentifier().getBytes();
+-}
+-/**
+- * Drop-in replacement for `cert.sign(key, md.sha256.create())` that computes
+- * the RSASSA-PKCS1-v1_5 / SHA-256 signature via Node's native `crypto.sign()`
+- * instead of node-forge's pure-JS RSA.
+- *
+- * node-forge routes RSA *keypair generation* to native `crypto` when available,
+- * but its `PrivateKey.sign()` is always pure JS, which is slow enough to matter
+- * because `generateEphemeralCA()` runs on the cold path of every process that
+- * constructs a SandboxManager. RSASSA-PKCS1-v1_5 is deterministic, so native
+- * `crypto.sign()` yields identical bytes.
+- */
+-export function signCertificateNative(cert, keyPem) {
+-    const oid = pki.oids.sha256WithRSAEncryption;
+-    cert.siginfo.algorithmOid = oid;
+-    cert.signatureOid = oid;
+-    cert.tbsCertificate = getTBSCertificate(cert);
+-    const tbsDer = asn1.toDer(cert.tbsCertificate).getBytes();
+-    cert.signature = rsaSha256SignNative(tbsDer, keyPem);
+-    // Match cert.sign()'s side effect so callers that read cert.md see the same
+-    // populated digest a forge-signed cert would carry.
+-    cert.md = md.sha256.create();
+-    cert.md.update(tbsDer);
+-}
+-/**
+- * RSASSA-PKCS1-v1_5 / SHA-256 sign of a forge binary-string `der` with the
+- * PEM-encoded RSA private key `keyPem`, returning the signature as a forge
+- * binary string. Native equivalent of `forgeKey.sign(sha256Digest)`.
+- */
+-export function rsaSha256SignNative(der, keyPem) {
+-    return cryptoSign('sha256', Buffer.from(der, 'binary'), keyPem).toString('binary');
+-}
+-/**
+- * Create a MitmCA. If `caCertPath`/`caKeyPath` are provided, load from disk
+- * (throws if either file is missing, unreadable, not PEM, fails to parse, or
+- * the key is not RSA). If both are omitted, generate an ephemeral CA into a
+- * fresh temp directory.
+- *
+- * Pure factory: no module-level state. The caller (SandboxManager) owns the
+- * returned object and its lifetime.
+- */
+-export function createMitmCA(opts) {
+-    if (opts.caCertPem && opts.caKeyPem) {
+-        const v = validateCaPair(opts.caCertPem, opts.caKeyPem);
+-        if (!v.ok)
+-            throw new Error(`tlsTerminate: CA PEM pair: ${v.reason}`);
+-        return buildMitmCA(opts.caCertPem, opts.caKeyPem, v.cert, v.key, {
+-            certPath: opts.caCertPath ?? '',
+-            keyPath: opts.caKeyPath ?? '',
+-            extraCaCertPaths: opts.extraCaCertPaths,
+-        });
+-    }
+-    if (opts.caCertPath && opts.caKeyPath) {
+-        return loadCA(opts.caCertPath, opts.caKeyPath, opts.extraCaCertPaths);
+-    }
+-    if (opts.caCertPath || opts.caKeyPath) {
+-        throw new Error('tlsTerminate: caCertPath and caKeyPath must be provided together');
+-    }
+-    return generateEphemeralCA(opts.extraCaCertPaths);
+-}
+-/**
+- * Remove the SRT-owned temp directories for this CA: the trust-bundle dir
+- * always, and the cert/key dir, a directory of its own, too when SRT
+- * generated the CA. User-supplied CA files are left alone.
+- */
+-export async function disposeMitmCA(ca) {
+-    for (const dir of ownedDirs(ca)) {
+-        try {
+-            await rm(dir, { recursive: true, force: true });
+-        }
+-        catch (err) {
+-            logForDebugging(`[mitm-ca] cleanup failed: ${err.message}`, {
+-                level: 'warn',
+-            });
+-        }
+-    }
+-}
+-/**
+- * {@link disposeMitmCA} in one synchronous step, as a process 'exit' handler
+- * needs it: nothing awaited runs there. Harmless before, during or after the
+- * asynchronous one.
+- */
+-export function disposeMitmCASync(ca) {
+-    for (const dir of ownedDirs(ca)) {
+-        try {
+-            rmSync(dir, { recursive: true, force: true });
+-        }
+-        catch (err) {
+-            logForDebugging(`[mitm-ca] cleanup failed: ${err.message}`, {
+-                level: 'warn',
+-            });
+-        }
+-    }
+-}
+-function ownedDirs(ca) {
+-    const dirs = new Set([dirname(ca.trustBundlePath)]);
+-    if (ca.ephemeral)
+-        dirs.add(dirname(ca.certPath));
+-    return dirs;
+-}
+-/**
+- * Write the child-facing trust bundle into `dir` and return its path: the
+- * MITM CA first, then the roots the host would normally trust, so HTTPS
+- * clients in the sandbox accept proxy-minted leaves AND can still verify the
+- * real certificate of any host SRT tunnels opaquely instead of terminating
+- * (tlsTerminate.excludeDomains). Bundling Node's root store is best-effort
+- * compatibility — a tool with its own CA file config is unaffected. Extra
+- * roots from tlsTerminate.extraCaCertPaths go last, with the same append
+- * semantics as NODE_EXTRA_CA_CERTS.
+- */
+-function writeTrustBundle(dir, caCertPem, extraCaCertPaths) {
+-    const parts = [caCertPem.trim(), ...rootCertificates];
+-    // Honour extra roots the parent process trusts (e.g. a corporate CA).
+-    const extra = process.env.NODE_EXTRA_CA_CERTS;
+-    if (extra) {
+-        try {
+-            parts.push(readFileSync(extra, 'utf8').trim());
+-        }
+-        catch {
+-            // Missing/unreadable NODE_EXTRA_CA_CERTS: ignore, same as Node does.
+-        }
+-    }
+-    // Honour site-local roots from config (tlsTerminate.extraCaCertPaths),
+-    // e.g. an internal mTLS CA presented by excluded/passthrough hosts. Paths
+-    // may exist on only some hosts, so a missing file is skipped, not fatal —
+-    // but log it, or a typo'd path is undiagnosable.
+-    for (const extraPath of extraCaCertPaths ?? []) {
+-        let raw;
+-        try {
+-            raw = readFileSync(extraPath, 'utf8');
+-        }
+-        catch (err) {
+-            const code = err.code ?? String(err);
+-            logForDebugging(`[mitm-ca] extraCaCertPaths: cannot read ${extraPath} (${code}); ` +
+-                `skipping`, { level: 'warn' });
+-            continue;
+-        }
+-        // Append only the CERTIFICATE blocks. The bundle is world-readable
+-        // (0o644) and handed to the sandboxed child, so anything else the file
+-        // carries (e.g. the key of a combined cert+key PEM) must not be copied.
+-        const certs = raw.match(PEM_CERT_BLOCK);
+-        if (!certs) {
+-            logForDebugging(`[mitm-ca] extraCaCertPaths: ${extraPath} has no PEM CERTIFICATE ` +
+-                `block; skipping`, { level: 'warn' });
+-            continue;
+-        }
+-        parts.push(...certs);
+-    }
+-    const path = join(dir, 'trust-bundle.crt');
+-    writeFileSync(path, parts.join('\n') + '\n', { mode: 0o644 });
+-    return path;
+-}
+-/**
+- * Build a DER-encoded X.509 v2 CRL, signed by `key`, listing zero revoked
+- * certificates. `nextUpdate` is the CA's `notAfter` (or now+1d if the CA is
+- * already expired) so a single per-session CRL stays fresh for the CA's
+- * lifetime.
+- *
+- * node-forge has no CRL builder, so this hand-assembles the RFC 5280 §5.1
+- * `CertificateList` from asn1 primitives — the same approach the library
+- * uses internally for certificates. Carries the two extensions RFC 5280
+- * §5.2 says conforming issuers MUST include: `authorityKeyIdentifier`
+- * (matching the CA's SKI) and `cRLNumber`.
+- */
+-export function generateEmptyCrl(cert, keyPem) {
+-    const SHA256_RSA = pki.oids.sha256WithRSAEncryption;
+-    const sigAlg = () => seq([
+-        asn1.create(C.UNIVERSAL, T.OID, false, asn1.oidToDer(SHA256_RSA).getBytes()),
+-        asn1.create(C.UNIVERSAL, T.NULL, false, ''),
+-    ]);
+-    // extnValue is the DER of the extension's own ASN.1, wrapped in an
+-    // OCTET STRING at the Extension level.
+-    const ext = (oid, value) => seq([
+-        asn1.create(C.UNIVERSAL, T.OID, false, asn1.oidToDer(oid).getBytes()),
+-        asn1.create(C.UNIVERSAL, T.OCTETSTRING, false, asn1.toDer(value).getBytes()),
+-    ]);
+-    const crlExtensions = asn1.create(C.CONTEXT_SPECIFIC, 0, true, [
+-        seq([
+-            // authorityKeyIdentifier ::= SEQUENCE { [0] KeyIdentifier }
+-            ext(pki.oids.authorityKeyIdentifier, seq([asn1.create(C.CONTEXT_SPECIFIC, 0, false, caSubjectKeyId(cert))])),
+-            // cRLNumber ::= INTEGER — one CRL per CA per session, so a fixed 1.
+-            ext('2.5.29.20', asn1.create(C.UNIVERSAL, T.INTEGER, false, '\x01')),
+-        ]),
+-    ]);
+-    const now = new Date();
+-    const caEnd = cert.validity.notAfter;
+-    const nextUpdate = caEnd > now ? caEnd : daysFromNow(1);
+-    const tbsCertList = seq([
+-        // version v2 == INTEGER 1 (required when crlExtensions is present)
+-        asn1.create(C.UNIVERSAL, T.INTEGER, false, '\x01'),
+-        sigAlg(),
+-        // Issuer Name: RFC 5280 §5.1.2.3 requires this match the CA subject
+-        // byte-for-byte. node-forge normalises DN attributes on parse (its
+-        // certificateFromPem re-encodes via distinguishedNameToAsn1 too, so the
+-        // "original" DER isn't recoverable via the library), which means a
+-        // user-supplied CA whose subject uses e.g. multi-valued RDNs or a
+-        // non-canonical string type could produce a differently-encoded issuer
+-        // here. Schannel matches on AKI keyid (present above) not issuer DN, and
+-        // the ephemeral CA is generated by the same encoder, so this holds in
+-        // practice; noted for completeness.
+-        pki.distinguishedNameToAsn1(cert.subject),
+-        asn1Time(now),
+-        asn1Time(nextUpdate),
+-        // revokedCertificates: OMITTED. RFC 5280: "When there are no revoked
+-        // certificates, the revoked certificates list MUST be absent."
+-        crlExtensions,
+-    ]);
+-    const sig = rsaSha256SignNative(asn1.toDer(tbsCertList).getBytes(), keyPem);
+-    const crl = seq([
+-        tbsCertList,
+-        sigAlg(),
+-        // BIT STRING: leading 0x00 = zero unused bits.
+-        asn1.create(C.UNIVERSAL, T.BITSTRING, false, '\x00' + sig),
+-    ]);
+-    return Buffer.from(asn1.toDer(crl).getBytes(), 'binary');
+-}
+-const C = asn1.Class;
+-const T = asn1.Type;
+-function seq(v) {
+-    return asn1.create(C.UNIVERSAL, T.SEQUENCE, true, v);
+-}
+-/** UTCTime for years <2050, GeneralizedTime otherwise (RFC 5280 §4.1.2.5). */
+-function asn1Time(d) {
+-    return d.getUTCFullYear() < 2050
+-        ? asn1.create(C.UNIVERSAL, T.UTCTIME, false, asn1.dateToUtcTime(d))
+-        : asn1.create(C.UNIVERSAL, T.GENERALIZEDTIME, false, asn1.dateToGeneralizedTime(d));
+-}
+-function loadCA(certPath, keyPath, extraCaCertPaths) {
+-    const certPem = readPem(certPath, 'CERTIFICATE', 'tlsTerminate.caCertPath');
+-    const keyPem = readPem(keyPath, 'PRIVATE KEY', 'tlsTerminate.caKeyPath');
+-    const v = validateCaPair(certPem, keyPem);
+-    if (!v.ok) {
+-        throw new Error(`tlsTerminate: CA at ${certPath}: ${v.reason}`);
+-    }
+-    logForDebugging(`[mitm-ca] loaded CA from ${certPath}`);
+-    return buildMitmCA(certPem, keyPem, v.cert, v.key, {
+-        certPath,
+-        keyPath,
+-        extraCaCertPaths,
+-    });
+-}
+-/**
+- * Assemble a {@link MitmCA} from an already-parsed cert+key. Shared by
+- * `loadCA` (explicit paths), `generateEphemeralCA`, and the Windows
+- * persistent-CA path so trust-bundle/CRL/cache setup lives in one place.
+- * `certPath`/`keyPath` are recorded verbatim; the trust bundle goes to a
+- * fresh mkdtemp so it's always disposable.
+- */
+-function buildMitmCA(certPem, keyPem, cert, key, opts) {
+-    const bundleDir = mkdtempSync(join(tmpdir(), 'srt-ca-'));
+-    return {
+-        certPath: opts.certPath,
+-        keyPath: opts.keyPath,
+-        trustBundlePath: writeTrustBundle(bundleDir, certPem, opts.extraCaCertPaths),
+-        certPem,
+-        keyPem,
+-        cert,
+-        key,
+-        leafCerts: new Map(),
+-        secureContexts: new Map(),
+-        crlDer: generateEmptyCrl(cert, keyPem),
+-        ephemeral: opts.ephemeral ?? false,
+-    };
+-}
+-/**
+- * Generate a self-signed RSA-2048 CA certificate + private key as PEM
+- * strings. Pure — no filesystem side effects; the caller decides where (and
+- * whether) to persist. This is the primitive under both the ephemeral
+- * per-process CA and the Windows persistent CA
+- * (`ensurePersistentWindowsCa`).
+- *
+- * @param opts.cn subject/issuer commonName. Default
+- *   `'sandbox-runtime ephemeral CA'`.
+- * @param opts.validityDays certificate `notAfter` in days from now.
+- *   Default 825 (the CA/B Forum limit for publicly-trusted leaves; not
+- *   binding on a private CA, but a reasonable rotation horizon).
+- */
+-export function generateCa(opts = {}) {
+-    const keys = pki.rsa.generateKeyPair(2048);
+-    const cert = pki.createCertificate();
+-    cert.publicKey = keys.publicKey;
+-    cert.serialNumber = randomSerial();
+-    cert.validity.notBefore = daysFromNow(-1);
+-    cert.validity.notAfter = daysFromNow(opts.validityDays ?? 825);
+-    const subject = [
+-        { name: 'commonName', value: opts.cn ?? 'sandbox-runtime ephemeral CA' },
+-        { name: 'organizationName', value: 'sandbox-runtime' },
+-    ];
+-    cert.setSubject(subject);
+-    cert.setIssuer(subject);
+-    cert.setExtensions([
+-        { name: 'basicConstraints', cA: true, critical: true },
+-        {
+-            name: 'keyUsage',
+-            critical: true,
+-            keyCertSign: true,
+-            cRLSign: true,
+-            digitalSignature: true,
+-        },
+-        { name: 'subjectKeyIdentifier' },
+-    ]);
+-    const keyPem = pki.privateKeyToPem(keys.privateKey);
+-    signCertificateNative(cert, keyPem);
+-    return {
+-        certPem: pki.certificateToPem(cert),
+-        keyPem,
+-        cert,
+-        key: keys.privateKey,
+-    };
+-}
+-/**
+- * SHA-1 thumbprint of `certPem` as uppercase hex with no separators —
+- * the format `srt-win user status` reports (`ca_cert_thumb`) and
+- * PowerShell's `Cert:\…\Thumbprint` uses. Throws if `certPem` is not a
+- * parseable X.509 certificate.
+- */
+-export function certThumbprint(certPem) {
+-    return new X509Certificate(certPem).fingerprint
+-        .replace(/:/g, '')
+-        .toUpperCase();
+-}
+-/**
+- * Check that `certPem` + `keyPem` are a usable RSA CA pair: both parse, the
+- * key is RSA (node-forge signs with nothing else), the private key's
+- * modulus matches the certificate's public key (i.e. this key actually
+- * signs for this cert), and `notBefore` is not in the future — a CA
+- * minted while the system clock was ahead and later NTP-corrected would
+- * otherwise be permanently not-yet-valid with nothing to trigger a
+- * regenerate. Returns the cert's thumbprint and `notAfter` on success so
+- * a caller can decide expiry policy without a second parse.
+- *
+- * Does not throw — a persistence layer that finds an unreadable/mismatched
+- * pair on disk treats `{ok: false}` as "regenerate", not a hard error.
+- */
+-export function validateCaPair(certPem, keyPem) {
+-    let cert;
+-    let key;
+-    try {
+-        cert = pki.certificateFromPem(certPem);
+-        key = pki.privateKeyFromPem(keyPem);
+-    }
+-    catch (err) {
+-        return { ok: false, reason: `parse: ${err.message}` };
+-    }
+-    if (!('n' in key) || !('d' in key)) {
+-        return { ok: false, reason: 'key is not RSA' };
+-    }
+-    if (cert.validity.notBefore.getTime() > Date.now()) {
+-        return {
+-            ok: false,
+-            reason: `notBefore ${cert.validity.notBefore.toISOString()} is in the future (clock skew?)`,
+-        };
+-    }
+-    const pub = cert.publicKey;
+-    if (!('n' in pub) || pub.n.compareTo(key.n)) {
+-        return { ok: false, reason: 'key does not match certificate public key' };
+-    }
+-    let thumbprint;
+-    try {
+-        thumbprint = certThumbprint(certPem);
+-    }
+-    catch (err) {
+-        return { ok: false, reason: `thumbprint: ${err.message}` };
+-    }
+-    return {
+-        ok: true,
+-        thumbprint,
+-        notAfter: cert.validity.notAfter,
+-        cert,
+-        key: key,
+-    };
+-}
+-function generateEphemeralCA(extraCaCertPaths) {
+-    const { certPem, keyPem, cert, key } = generateCa();
+-    // Write to disk so trust env vars (NODE_EXTRA_CA_CERTS etc.) can point at
+-    // a real path. mkdtemp gives us an unguessable per-process directory.
+-    const dir = mkdtempSync(join(tmpdir(), 'srt-ca-'));
+-    const certPath = join(dir, 'ca.crt');
+-    const keyPath = join(dir, 'ca.key');
+-    writeFileSync(certPath, certPem, { mode: 0o644 });
+-    writeFileSync(keyPath, keyPem, { mode: 0o600 });
+-    logForDebugging(`[mitm-ca] generated ephemeral CA at ${certPath}`);
+-    return buildMitmCA(certPem, keyPem, cert, key, {
+-        certPath,
+-        keyPath,
+-        extraCaCertPaths,
+-        ephemeral: true,
+-    });
+-}
+-function readPem(path, label, field) {
+-    let pem;
+-    try {
+-        pem = readFileSync(path, 'utf8');
+-    }
+-    catch (err) {
+-        const code = err.code ?? String(err);
+-        throw new Error(`${field}: cannot read ${path} (${code})`);
+-    }
+-    // Accept either the exact label or a prefixed variant (e.g. "RSA PRIVATE KEY",
+-    // "EC PRIVATE KEY") for the key case.
+-    if (!new RegExp(`-----BEGIN [A-Z ]*${label}-----`).test(pem)) {
+-        throw new Error(`${field}: ${path} is not a PEM ${label}`);
+-    }
+-    return pem;
+-}
+-export function randomSerial() {
+-    // 16 random bytes whose first two bits are 01. The high bit is clear so
+-    // that the DER INTEGER is positive, and the next is set so that it has no
+-    // leading zero byte: a parser refuses an INTEGER with more of them than the
+-    // sign needs, and with it the whole certificate.
+-    const hex = util.bytesToHex(random.getBytesSync(16));
+-    const firstNibble = (parseInt(hex[0], 16) & 0x3) | 0x4;
+-    return firstNibble.toString(16) + hex.slice(1);
+-}
+-export function daysFromNow(days) {
+-    const d = new Date();
+-    d.setDate(d.getDate() + days);
+-    return d;
+-}
+-//# sourceMappingURL=mitm-ca.js.map
+\ No newline at end of file
++/** NanoClaw: TLS certificate minting is intentionally unavailable. */
++export const CRL_PATH='/srt.crl';
++export function caSubjectKeyId() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function signCertificateNative() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function rsaSha256SignNative() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function createMitmCA() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function disposeMitmCA() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function disposeMitmCASync() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function generateEmptyCrl() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function generateCa() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function certThumbprint() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function validateCaPair() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function randomSerial() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function daysFromNow() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
+diff --git a/dist/sandbox/mitm-leaf.js b/dist/sandbox/mitm-leaf.js
+index 646432069ef59e0775c6829f6deccdf623b43c0a..ee95f948eaaab4e5cd5f20d085101b4303b26d4c 100644
+--- a/dist/sandbox/mitm-leaf.js
++++ b/dist/sandbox/mitm-leaf.js
+@@ -1,139 +1,3 @@
+-/**
+- * Per-host leaf certificate minter for the in-process TLS-terminating proxy.
+- *
+- * Given a MitmCA (see mitm-ca.ts), mints a leaf certificate for a specific
+- * hostname on first use and caches it for the lifetime of that CA instance.
+- * The leaf is signed by the CA and carries SAN=DNS:<host> (or IP:<addr>),
+- * so a client that trusts the CA will accept it for that host.
+- */
+-import forge from 'node-forge';
+-import { isIP } from 'node:net';
+-import { createSecureContext } from 'node:tls';
+-import { logForDebugging } from '../utils/debug.js';
+-import { caSubjectKeyId, daysFromNow, randomSerial, signCertificateNative, } from './mitm-ca.js';
+-const { pki } = forge;
+-/**
+- * Mint (or return cached) an RSA-2048 leaf cert for `hostname`, signed by `ca`.
+- * The cache lives on `ca.leafCerts`.
+- */
+-export function mintLeafCert(ca, hostname) {
+-    const cached = cacheGet(ca.leafCerts, hostname);
+-    if (cached)
+-        return cached;
+-    // One key for every leaf of this CA, as mitmproxy does: a new host name
+-    // then costs a signature, not an RSA key generation that would hold up
+-    // every other tunnel. The key never leaves this process.
+-    const keys = (ca.leafKeyPair ?? (ca.leafKeyPair = pki.rsa.generateKeyPair(2048)));
+-    const cert = pki.createCertificate();
+-    cert.publicKey = keys.publicKey;
+-    cert.serialNumber = randomSerial();
+-    const notBefore = daysFromNow(-1);
+-    cert.validity.notBefore = notBefore;
+-    cert.validity.notAfter = clampValidity(ca.cert, notBefore);
+-    cert.setSubject([{ name: 'commonName', value: hostname }]);
+-    cert.setIssuer(ca.cert.subject.attributes);
+-    cert.setExtensions([
+-        { name: 'basicConstraints', cA: false, critical: true },
+-        {
+-            name: 'keyUsage',
+-            critical: true,
+-            digitalSignature: true,
+-            keyEncipherment: true,
+-        },
+-        { name: 'extKeyUsage', serverAuth: true },
+-        { name: 'subjectAltName', altNames: [sanFor(hostname)] },
+-        { name: 'subjectKeyIdentifier' },
+-        // Python ≥3.13 enables ssl.VERIFY_X509_STRICT by default, which enforces
+-        // RFC 5280's "AKI MUST be present on non-self-signed certs". curl/Go/Node
+-        // don't enforce this, but requests/urllib3/httpx/google-auth all reject
+-        // a leaf without AKI under 3.13. See caSubjectKeyId() in mitm-ca.ts for
+-        // why we can't just pass the CA's stored SKI value through.
+-        { name: 'authorityKeyIdentifier', keyIdentifier: caSubjectKeyId(ca.cert) },
+-        // Schannel (Windows System32 curl, git's default backend, cargo) checks
+-        // revocation on the LEAF and hard-fails CRYPT_E_NO_REVOCATION_CHECK when
+-        // there's no CDP to consult. Point it at the empty CRL the proxy serves
+-        // on 127.0.0.1 (see MitmCA.crlDer / http-proxy.ts) so the check resolves
+-        // to "not revoked" instead of "unknown". node-forge encodes CDP with the
+-        // same {altNames} shape as SAN; type 6 = uniformResourceIdentifier.
+-        // OpenSSL-backed clients don't check CRLs by default, so a leaf minted
+-        // before the port is bound (crlUrl unset) works everywhere except
+-        // Schannel-with-revocation.
+-        ...(ca.crlUrl
+-            ? [
+-                {
+-                    name: 'cRLDistributionPoints',
+-                    altNames: [{ type: 6, value: ca.crlUrl }],
+-                },
+-            ]
+-            : []),
+-    ]);
+-    signCertificateNative(cert, ca.keyPem);
+-    const leaf = {
+-        certPem: pki.certificateToPem(cert) + ca.certPem,
+-        keyPem: pki.privateKeyToPem(keys.privateKey),
+-    };
+-    cacheSet(ca.leafCerts, hostname, leaf, ca.cacheLimit ?? LEAF_CACHE_LIMIT);
+-    logForDebugging(`[mitm-leaf] minted RSA leaf for ${hostname}`);
+-    return leaf;
+-}
+-/**
+- * Mint-or-cache a Node TLS SecureContext for `hostname`. Intended as the
+- * SNICallback target in the terminating proxy. The cache lives on
+- * `ca.secureContexts`.
+- */
+-export function secureContextFor(ca, hostname) {
+-    const cached = cacheGet(ca.secureContexts, hostname);
+-    if (cached)
+-        return cached;
+-    const { certPem, keyPem } = mintLeafCert(ca, hostname);
+-    const ctx = createSecureContext({ cert: certPem, key: keyPem });
+-    cacheSet(ca.secureContexts, hostname, ctx, ca.cacheLimit ?? LEAF_CACHE_LIMIT);
+-    return ctx;
+-}
+-function sanFor(hostname) {
+-    // RFC 5280 GeneralName tags: 2 = dNSName, 7 = iPAddress.
+-    return isIP(hostname) !== 0
+-        ? { type: 7, ip: hostname }
+-        : { type: 2, value: hostname };
+-}
+-/**
+- * Leaf validity capped at min(CA notAfter, notBefore+99d).
+- *
+- * 99d sits below every TLS cert validity ceiling we care about: the current
+- * (2026-03) CA/B baseline of 200d, the next step-down to 100d in 2027-03, the
+- * historical 398d public cap, and the macOS ~825d ceiling that trips
+- * errSecCertificateIsNotStandardsCompliant on user-installed roots. Leaves are
+- * re-minted per session, so we don't need the headroom.
+- *
+- * Anchored at notBefore — not now — because notBefore is backdated by 1 day,
+- * so `now+Nd` would produce an (N+1)-day span and lose a day of margin.
+- */
+-function clampValidity(caCert, notBefore) {
+-    const caEnd = caCert.validity.notAfter;
+-    const max = new Date(notBefore);
+-    max.setDate(max.getDate() + 99);
+-    return caEnd < max ? new Date(caEnd) : max;
+-}
+-/**
+- * At most this many host names' leaf certs (and secure contexts) are kept
+- * per CA, the least recently used going first: each costs an RSA key, and
+- * the names come from the clients.
+- */
+-const LEAF_CACHE_LIMIT = 256;
+-function cacheGet(cache, key) {
+-    const value = cache.get(key);
+-    if (value !== undefined) {
+-        cache.delete(key);
+-        cache.set(key, value);
+-    }
+-    return value;
+-}
+-function cacheSet(cache, key, value, limit) {
+-    cache.set(key, value);
+-    for (const oldest of cache.keys()) {
+-        if (cache.size <= limit)
+-            break;
+-        cache.delete(oldest);
+-    }
+-}
+-//# sourceMappingURL=mitm-leaf.js.map
+\ No newline at end of file
++/** NanoClaw: TLS certificate minting is intentionally unavailable. */
++export function mintLeafCert() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
++export function secureContextFor() {throw new Error('NanoClaw disables Sandbox Runtime TLS interception; use the credential gateway. Vulnerable node-forge support has been removed.');}
+diff --git a/dist/sandbox/sandbox-config.js b/dist/sandbox/sandbox-config.js
+index 76b00b1dc82a2d42a451a9f58068cbbd5e68da75..7f341df2645331f01f8cd4ca3d5cac81cd14a8c8 100644
+--- a/dist/sandbox/sandbox-config.js
++++ b/dist/sandbox/sandbox-config.js
+@@ -616,6 +616,9 @@ export const NetworkConfigSchema = z.object({
+         .boolean()
+         .optional()
+         .describe('If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK).'),
++    allowOutboundInternet: z.boolean().optional(),
++    localConnectPorts: z.array(z.number().int().min(1024).max(65535)).optional(),
++    listenPorts: z.array(z.number().int().min(1024).max(65535)).optional(),
+     allowLocalBinding: z
+         .boolean()
+         .optional()
+@@ -712,90 +715,7 @@ export const NetworkConfigSchema = z.object({
+         'normalizedRequestTarget and requestTargetIsAmbiguous. "normalize": ' +
+         'forwarded normalized, which breaks a signature over the path and ' +
+         'names another resource to an upstream that takes the path literally.'),
+-    tlsTerminate: z
+-        .object({
+-        caCertPath: z
+-            .string()
+-            .min(1)
+-            .optional()
+-            .describe('Path to a PEM-encoded CA certificate. The sandboxed child is ' +
+-            'configured to trust this CA, and the TLS-terminating proxy uses ' +
+-            'it to sign per-host certificates. If omitted, on Windows SRT ' +
+-            'generates-if-absent a persistent CA under ' +
+-            '%ProgramData%\\sandbox-runtime\\ca\\ and trusts it in the ' +
+-            "sandbox user's Root store; on other platforms SRT generates " +
+-            'an ephemeral CA into a temp directory for the lifetime of the ' +
+-            'session.'),
+-        caKeyPath: z
+-            .string()
+-            .min(1)
+-            .optional()
+-            .describe('Path to the PEM-encoded private key for caCertPath.'),
+-        excludeDomains: z
+-            .array(domainPatternSchema)
+-            .optional()
+-            .describe('Domain patterns (same syntax as allowedDomains) whose HTTPS ' +
+-            'connections are NOT terminated. Matching CONNECTs are opaque ' +
+-            'byte tunnels: still subject to the allow/deny domain lists, ' +
+-            'but the sandboxed client completes its own TLS handshake with ' +
+-            'the upstream, so filterRequest and credential injection do not ' +
+-            'apply to their HTTPS traffic (plain-HTTP requests to the same ' +
+-            'hosts keep the normal request pipeline). Use for hosts the ' +
+-            'proxy must not re-originate: ' +
+-            'mTLS upstreams (only the client holds the client certificate) ' +
+-            'and clients that pin the upstream certificate and would reject ' +
+-            'the MITM CA. Hosts still need to be reachable via ' +
+-            'allowedDomains; this list only changes how they are tunnelled.'),
+-        extraCaCertPaths: z
+-            .array(z.string().min(1))
+-            .optional()
+-            .describe('Paths to PEM CA certificate files appended to the trust bundle ' +
+-            'the sandboxed child is pointed at, after the MITM CA and the ' +
+-            "host's regular roots. Use for site-local roots (e.g. an " +
+-            'internal mTLS CA) presented by excluded/passthrough hosts, so ' +
+-            'the child can verify them itself. Only the CERTIFICATE blocks ' +
+-            'of each file are copied; files that are missing, unreadable, ' +
+-            'or contain no PEM CERTIFICATE block are skipped (with a debug ' +
+-            'log), so paths that exist on only some hosts are safe to list.'),
+-        maxTunnels: z
+-            .number()
+-            .int()
+-            .min(1)
+-            .max(65536)
+-            .optional()
+-            .describe('At most this many CONNECT tunnels are TLS-terminated at once ' +
+-            '(default 256); past it a CONNECT is answered 503 with ' +
+-            '"X-Proxy-Error: too-many-tunnels", and the refusal is recorded ' +
+-            'as a violation, once per command until half the slots are free ' +
+-            'again. A tunnel holds its slot from its CONNECT until it ' +
+-            'closes, so idle keep-alive tunnels count until they are closed ' +
+-            '(6 s after a response); ' +
+-            'one that turns out not to carry TLS frees it. The slot is taken ' +
+-            'before the first bytes are seen, so at the cap a non-TLS CONNECT ' +
+-            '(SSH, say) to a host that would be terminated is refused too. ' +
+-            'Hosts in excludeDomains do not count. Read at each CONNECT, so ' +
+-            'updateConfig changes it for the tunnels that follow.'),
+-        handshakeTimeoutMs: z
+-            .number()
+-            .int()
+-            .min(100)
+-            .max(600000)
+-            .optional()
+-            .describe('A tunnel to be TLS-terminated must finish its TLS handshake ' +
+-            'within this many milliseconds of its CONNECT (default 10000), ' +
+-            'or it is closed and its slot freed. A tunnel past its handshake ' +
+-            'is never timed out by it. Read at each CONNECT, so ' +
+-            'updateConfig changes it for the tunnels that follow.'),
+-    })
+-        .refine(o => !o.caCertPath === !o.caKeyPath, {
+-        message: 'caCertPath and caKeyPath must be provided together',
+-    })
+-        .optional()
+-        .describe('[EXPERIMENTAL] Enable in-process TLS termination so HTTPS ' +
+-        'request/response bodies are visible to SRT. Provide a CA cert+key, ' +
+-        'or omit both to have SRT generate an ephemeral one. Needs Node, or ' +
+-        'Bun 1.4 or later: SandboxManager.initialize throws on an older ' +
+-        'runtime.'),
++    tlsTerminate: z.never().optional().describe('Disabled by NanoClaw: TLS interception belongs to its credential gateway.'),
+     parentProxy: ParentProxyConfigSchema.optional().describe("Upstream HTTP proxy for outbound connections. When set, SRT's proxy " +
+         'tunnels non-mitmProxy traffic through this parent instead of ' +
+         'connecting directly. Falls back to HTTP_PROXY/HTTPS_PROXY/NO_PROXY ' +
+diff --git a/dist/sandbox/sandbox-manager.js b/dist/sandbox/sandbox-manager.js
+index d475e55977bf54a2fe00a0c6aba38313761d55aa..dbcfad9254aa231e23452ada340fa0b9ac5ee5ca 100644
+--- a/dist/sandbox/sandbox-manager.js
++++ b/dist/sandbox/sandbox-manager.js
+@@ -1991,6 +1991,9 @@ async function wrapWithSandboxOnce(walkEnded, restarts, command, binShell, custo
+                 degradeToDenyPaths: credentialRestrictions.degradeToDenyPaths,
+                 allowUnixSockets: getAllowUnixSockets(),
+                 allowAllUnixSockets: getAllowAllUnixSockets(),
++                allowOutboundInternet: config?.network?.allowOutboundInternet,
++                localConnectPorts: config?.network?.localConnectPorts,
++                listenPorts: config?.network?.listenPorts,
+                 allowLocalBinding: getAllowLocalBinding(),
+                 allowMachLookup: getAllowMachLookup(),
+                 ignoreViolations: getIgnoreViolations(),

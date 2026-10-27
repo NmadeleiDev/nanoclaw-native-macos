@@ -1,0 +1,40 @@
+{
+  "checkedAt": "2026-10-27T16:10:46.607573Z",
+  "packages": [
+    {
+      "name": "@anthropic-ai/sandbox-runtime",
+      "version": "0.0.81",
+      "latestStable": "0.0.81",
+      "published": "2026-10-20T01:13:23.926Z",
+      "deprecated": false,
+      "license": "Apache-2.0",
+      "engines": {
+        "node": ">=22.12.0"
+      },
+      "advisories": [],
+      "registry": "https://registry.npmjs.org/%40anthropic-ai%2Fsandbox-runtime"
+    },
+    {
+      "name": "zod",
+      "version": "4.6.7",
+      "latestStable": "4.6.7",
+      "published": "2026-10-12T16:29:37.778Z",
+      "deprecated": false,
+      "license": "MIT",
+      "engines": null,
+      "advisories": [],
+      "registry": "https://registry.npmjs.org/zod"
+    },
+    {
+      "name": "@opencode-ai/sdk",
+      "version": "1.19.4",
+      "latestStable": "1.19.4",
+      "published": "2026-10-22T13:03:16.427Z",
+      "deprecated": false,
+      "license": "MIT",
+      "engines": null,
+      "advisories": [],
+      "registry": "https://registry.npmjs.org/%40opencode-ai%2Fsdk"
+    }
+  ]
+}

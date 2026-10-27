@@ -1,0 +1,3238 @@
+diff --git a/.claude/skills/add-onecli/payload/src/gateway-providers/onecli.test.ts b/.claude/skills/add-onecli/payload/src/gateway-providers/onecli.test.ts
+index 98d0e42..3e759c1 100644
+--- a/.claude/skills/add-onecli/payload/src/gateway-providers/onecli.test.ts
++++ b/.claude/skills/add-onecli/payload/src/gateway-providers/onecli.test.ts
+@@ -235,6 +235,38 @@ describe('OneCLI gateway package', () => {
+     }
+   });
+ 
++  it('defers native credential file writes to the sandbox and keeps the upstream proxy out of the child environment', async () => {
++    const root = fs.mkdtempSync(path.resolve('.cache/native-gateway-'));
++    const controller = new AbortController();
++    try {
++      const native = {
++        ...input('native'),
++        capabilities: { nativeProcesses: true } as never,
++        nativePaths: { home: path.join(root, 'home'), tmp: path.join(root, 'tmp') },
++      };
++      const lease = await provider.sessions.ensure(native, controller.signal);
++      expect(lease.contribution.nativeProxy).toEqual({
++        http: 'http://127.0.0.1:15001/',
++        https: 'http://127.0.0.1:15001/',
++      });
++      expect(lease.contribution.env?.HTTPS_PROXY).toBeUndefined();
++      expect(lease.contribution.nativeReadonly?.length).toBeGreaterThan(0);
++      for (const file of lease.contribution.nativeReadonly!) {
++        expect(fs.statSync(file).isFile()).toBe(true);
++      }
++      expect(lease.contribution.nativeFiles?.length).toBeGreaterThan(0);
++      for (const file of lease.contribution.nativeFiles!) {
++        expect(file.target.startsWith(root + '/')).toBe(true);
++        expect(lease.contribution.nativeReadonly).toContain(file.source);
++        expect(fs.existsSync(file.target)).toBe(false);
++      }
++      expect(lease.contribution.mounts).toBeUndefined();
++    } finally {
++      controller.abort();
++      fs.rmSync(root, { recursive: true, force: true });
++    }
++  });
++
+   it('owns endpoint configuration and returns a typed session contribution', async () => {
+     const controller = new AbortController();
+     const lease = await provider.sessions.ensure(input('s1'), controller.signal);
+diff --git a/.claude/skills/add-onecli/payload/src/gateway-providers/onecli.ts b/.claude/skills/add-onecli/payload/src/gateway-providers/onecli.ts
+index 50a951e..ec6e019 100644
+--- a/.claude/skills/add-onecli/payload/src/gateway-providers/onecli.ts
++++ b/.claude/skills/add-onecli/payload/src/gateway-providers/onecli.ts
+@@ -1,3 +1,4 @@
++import path from 'node:path';
+ import { normalizeGatewayApprovalSummary } from '../gateway-approval-summary.js';
+ /** OneCLI typed configuration and supervised native approval adapter. */
+ import { OneCLI, ApprovalClient, type ContainerConfig, type ApprovalRequest } from '@onecli-sh/sdk';
+@@ -315,6 +316,45 @@ async function ensureSession(input: GatewaySessionInput, signal: AbortSignal): P
+   await ensureAgentReady(input.key.agentGroupId, input.groupName, input.provider);
+   const config = await onecli.getContainerConfig({ agent: input.key.agentGroupId });
+   const accountId = await stubAccountId(config);
++  if (input.capabilities.nativeProcesses) {
++    if (!input.nativePaths) throw new Error('Native gateway execution requires host-resolved state paths');
++    const contribution = withProviderEnv(contributionFromConfig(config, input.key.agentGroupId, DATA_DIR, accountId));
++    const nativeEnv = { ...contribution.env };
++    const readonly: string[] = [];
++    const nativeFiles: Array<{ source: string; target: string }> = [];
++    for (const mount of contribution.mounts ?? []) {
++      const target = mount.containerPath.startsWith('/home/node/')
++        ? path.join(input.nativePaths.home, mount.containerPath.slice('/home/node/'.length))
++        : mount.containerPath.startsWith('/tmp/')
++          ? path.join(input.nativePaths.tmp, mount.containerPath.slice('/tmp/'.length))
++          : undefined;
++      if (!target) throw new Error(`OneCLI cannot map native credential material: ${mount.containerPath}`);
++      nativeFiles.push({ source: mount.hostPath, target });
++      readonly.push(mount.hostPath);
++      for (const [key, value] of Object.entries(nativeEnv)) if (value === mount.containerPath) nativeEnv[key] = target;
++    }
++    const proxy = (value: string | undefined) => {
++      if (!value) throw new Error('OneCLI did not supply a native upstream proxy');
++      const url = new URL(value);
++      if (url.hostname === 'host.docker.internal') url.hostname = '127.0.0.1';
++      if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported OneCLI native proxy transport');
++      return url.toString();
++    };
++    const https = proxy(nativeEnv.HTTPS_PROXY ?? nativeEnv.https_proxy);
++    const http = proxy(nativeEnv.HTTP_PROXY ?? nativeEnv.http_proxy ?? nativeEnv.HTTPS_PROXY ?? nativeEnv.https_proxy);
++    for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy'])
++      delete nativeEnv[key];
++    return {
++      ...monitorLease(signal),
++      contribution: {
++        env: nativeEnv,
++        nativeReadonly: readonly,
++        nativeFiles,
++        nativeProxy: { http, https },
++        networkAccess: { endpoint: new URL(https).hostname, target: { kind: 'host' } },
++      },
++    };
++  }
+   log.info('OneCLI gateway applied', { agentGroupId: input.key.agentGroupId, sessionId: input.key.sessionId });
+   return {
+     ...monitorLease(signal),
+diff --git a/.claude/skills/add-opencode/ARCHITECTURE.md b/.claude/skills/add-opencode/ARCHITECTURE.md
+index 50997e7..503bf40 100644
+--- a/.claude/skills/add-opencode/ARCHITECTURE.md
++++ b/.claude/skills/add-opencode/ARCHITECTURE.md
+@@ -1,7 +1,7 @@
+ # OpenCode provider execution and setup
+ 
+ The provider targets NanoClaw's host contract seam version 1 and pins the native
+-OpenCode CLI and SDK together at 1.18.25. The skill owns its runtime, host, setup,
++OpenCode CLI and SDK together at 1.19.4. The skill owns its runtime, host, setup,
+ and authentication adapters. The core supplies provider contracts, delivery
+ wording, the memory renderer, resolved MCP configuration, and container policy.
+ 
+@@ -38,7 +38,7 @@ wording to one file under writable XDG data. The write happens under the existin
+ turn lock. The file is listed in native `instructions` next to the group's
+ `CLAUDE.md` and `CLAUDE.local.md`.
+ 
+-OpenCode 1.18.25 rereads those files on each model step, including native
++OpenCode 1.19.4 rereads those files on each model step, including native
+ continuation after compaction. Task children use the same global configuration
+ and inherit the current turn's file. No plugin, native memory hooks, parent walk,
+ or per-session snapshot store is needed.
+diff --git a/.claude/skills/add-opencode/SKILL.md b/.claude/skills/add-opencode/SKILL.md
+index 7290846..64e0235 100644
+--- a/.claude/skills/add-opencode/SKILL.md
++++ b/.claude/skills/add-opencode/SKILL.md
+@@ -43,7 +43,7 @@ and is independent of the container's gateway credentials. Installed setup failu
+ use the existing provider failure-assist hook, including wizard authentication
+ and installation-check failures. Host diagnostic context is model input and may
+ remain in native OpenCode history; deleting its private temporary file does not
+-erase those records. The helper requires stable OpenCode 1.18.25 or newer with
++erase those records. The helper requires stable OpenCode 1.19.4 or newer with
+ `--prompt` and prefers the newest compatible installation it finds.
+ `--debug`, `--update` and failure help launch it with an `OPENCODE_PERMISSION`
+ override, so OpenCode asks before every edit and command even when the
+@@ -54,12 +54,12 @@ Automatic help before payload
+ installation is optional and is not part of the runtime contract.
+ 
+ Install and refresh require host contract version 1 and credential-connection
+-seam version 1 or later. The compatibility predicate
++seam version 1 or later, plus this fork’s core-owned runtime layout. The compatibility predicate
+ below guards every subsequent step, so an unsupported core receives no partial
+ payload or dependency changes. Update core first if it reports a missing prerequisite.
+ 
+ ```nc:run effect:refresh capture:opencode_core_ready validate:^yes$
+-node -e "const fs=require('fs'); const p='src/provider-contracts/registry.ts', g='setup/gateways/credential-store.ts'; if(fs.existsSync(p) && /PROVIDER_HOST_CONTRACT_SEAM_VERSION = 1/.test(fs.readFileSync(p,'utf8')) && fs.existsSync(g) && /PROVIDER_CREDENTIAL_CONNECTION_SEAM_VERSION = [1-9]/.test(fs.readFileSync(g,'utf8'))) console.log('yes'); else console.log('no')"
++node -e "const fs=require('fs'); const p='src/provider-contracts/registry.ts', g='setup/gateways/credential-store.ts'; if(fs.existsSync('container/agent-runner/src/runtime-layout.ts') && fs.existsSync(p) && /PROVIDER_HOST_CONTRACT_SEAM_VERSION = 1/.test(fs.readFileSync(p,'utf8')) && fs.existsSync(g) && /PROVIDER_CREDENTIAL_CONNECTION_SEAM_VERSION = [1-9]/.test(fs.readFileSync(g,'utf8'))) console.log('yes'); else console.log('no')"
+ ```
+ 
+ Copy only the files listed below from this skill's `payload/` to the matching
+@@ -120,6 +120,7 @@ payload/src/provider-contracts/opencode.ts -> src/provider-contracts/opencode.ts
+ payload/src/providers/opencode-auth-stub.ts -> src/providers/opencode-auth-stub.ts
+ payload/src/providers/opencode-registration.test.ts -> src/providers/opencode-registration.test.ts
+ payload/src/providers/opencode.ts -> src/providers/opencode.ts
++payload/src/model-connections.ts -> src/model-connections.ts
+ ```
+ 
+ Append `import './opencode.js';` once to each of the five setup, provider, and contract
+@@ -146,16 +147,16 @@ import './opencode.js';
+ ```
+ 
+ Install the SDK in the runner's Bun package and add the matching CLI manifest
+-entry with trusted postinstall enabled. Both pins must remain exactly 1.18.25. When refreshing an existing install,
++entry with trusted postinstall enabled. Both pins must remain exactly 1.19.4. When refreshing an existing install,
+ replace both old pin entries; presence alone does not establish compatibility.
+ This updates the runner package and lockfile; there is no host SDK dependency.
+ 
+ ```nc:dep manager:bun cwd:container/agent-runner when:opencode_core_ready=yes
+-@opencode-ai/sdk@1.18.25
++@opencode-ai/sdk@1.19.4
+ ```
+ 
+ ```nc:json-merge into:container/cli-tools.json key:name when:opencode_core_ready=yes
+-{"name":"opencode-ai","version":"1.18.25","onlyBuilt":true}
++{"name":"opencode-ai","version":"1.19.4","onlyBuilt":true}
+ ```
+ 
+ Run the host build, runner typecheck, host/auth tests, and all provider tests.
+@@ -308,6 +309,7 @@ The host reads these values from exported environment variables, then `.env`.
+ Put comments on separate lines. These settings affect only OpenCode containers.
+ 
+ - `OPENCODE_PROVIDER`: OpenCode backend ID, such as `openai` or `openrouter`.
++- `OPENCODE_API_TYPE`: optional `openai-compatible` for Chat Completions, `openai-responses` for Responses, `anthropic` for Messages, or `native` for OpenCode's own transport selection. For example, BytePlus can use `OPENCODE_PROVIDER=byteplus`, `OPENCODE_MODEL=byteplus/glm-5.2`, and `OPENCODE_API_TYPE=openai-compatible` with its Coding Plan base URL.
+ - `OPENCODE_MODEL`: default full `provider/model` ID. The group's model wins.
+ - `OPENCODE_SMALL_MODEL`: optional separate model for lighter work, using the same backend prefix as `OPENCODE_PROVIDER`.
+ - `OPENCODE_BASE_URL`: backend URL, or `native` to use the native endpoint.
+@@ -327,7 +329,7 @@ MCP configuration and container policy. See [ARCHITECTURE.md](ARCHITECTURE.md) f
+ turn completion, memory snapshots, offline startup, cancellation, and MCP timeouts.
+ 
+ For reproducible native integration coverage, download the official OpenCode
+-1.18.25 binary and run from `container/agent-runner`:
++1.19.4 binary and run from `container/agent-runner`:
+ 
+ ```bash
+ OPENCODE_TEST_BINARY=/absolute/path/opencode bun test --isolate src/providers/opencode.native.test.ts
+diff --git a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-config.ts b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-config.ts
+index 9d9f0e6..6c6993c 100644
+--- a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-config.ts
++++ b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-config.ts
+@@ -1,10 +1,11 @@
++import { runtimeLayout, runtimeToolAllowed } from '../runtime-layout.js';
+ import type { ProviderOptions } from './types.js';
+ import type { ResolvedRuntimeConfiguration, RuntimeInferenceInput } from '../provider-contracts/registry.js';
+ import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
+ import { openCodeInstructionsPath } from './opencode-memory.js';
+ import { OPENCODE_CREDENTIAL_PLACEHOLDER } from './opencode-auth.js';
+ const MODEL_INPUT_MODALITIES = ['text', 'audio', 'image', 'video', 'pdf'] as const;
+-const AGENT_DIR = '/workspace/agent';
++const AGENT_DIR = runtimeLayout().agent;
+ 
+ export function buildOpenCodeServerEnv(
+   config: Record<string, unknown>,
+@@ -51,6 +52,10 @@ export function resolveOpenCodeInference(
+   // suppresses the historical shared-variable fallback without editing it.
+   const endpoint = environment.OPENCODE_BASE_URL ?? environment.ANTHROPIC_BASE_URL;
+   const proxyUrl = endpoint === 'native' ? undefined : endpoint;
++  const apiType = environment.OPENCODE_API_TYPE;
++  if (apiType && !['native', 'openai-compatible', 'openai-responses', 'anthropic'].includes(apiType))
++    throw new Error('OPENCODE_API_TYPE must be native, openai-compatible, openai-responses or anthropic');
++  const compatible = apiType === 'openai-compatible' || (!apiType && provider === 'openai' && !!proxyUrl);
+ 
+   const stripProviderPrefix = (value: string | undefined) =>
+     value?.startsWith(`${provider}/`) ? value.slice(provider.length + 1) : value;
+@@ -111,11 +116,12 @@ export function resolveOpenCodeInference(
+       // OpenAI-compatible endpoint (vLLM, llama.cpp, …). The stock openai
+       // SDK package speaks the Responses API, whose multi-turn history
+       // vLLM rejects (assistant items lack id/status) — pin the Chat
+-      // Completions transport. Scoped to `openai` only: other providers
++      // Completions transport. An explicit API type lets custom aliases
++      // select the same transport without pretending to be OpenAI. Other providers
+       // (e.g. `openrouter`, set alongside ANTHROPIC_BASE_URL per the
+       // documented OpenRouter config) ship their own native ai-sdk
+       // package and must keep OpenCode's default transport resolution.
+-      ...(provider === 'openai' && proxyUrl ? { npm: '@ai-sdk/openai-compatible' } : {}),
++      ...(compatible ? { npm: '@ai-sdk/openai-compatible' } : apiType === 'openai-responses' ? { npm: '@ai-sdk/openai' } : apiType === 'anthropic' ? { npm: '@ai-sdk/anthropic' } : {}),
+       options: { apiKey: OPENCODE_CREDENTIAL_PLACEHOLDER, ...(proxyUrl ? { baseURL: proxyUrl } : {}) },
+       ...(modelsToRegister.length > 0
+         ? {
+@@ -204,8 +210,19 @@ export function buildOpenCodeConfig(
+   >;
+   return {
+     ...inference,
+-    permission: configuration ? configuration.executionPolicy : resolveOpenCodeExecutionPolicy(),
+-    mcp: configuration ? configuration.mcpServers : mcpServersToOpenCodeConfig(options.mcpServers),
++    permission:
++      runtimeLayout().kind === 'native' && !options.utilityMode
++        ? nativeOpenCodePermissions()
++        : options.utilityMode
++          ? { '*': 'deny' }
++          : configuration
++            ? configuration.executionPolicy
++            : resolveOpenCodeExecutionPolicy(),
++    mcp: options.utilityMode
++      ? {}
++      : configuration
++        ? configuration.mcpServers
++        : mcpServersToOpenCodeConfig(options.mcpServers),
+     autoupdate: false,
+     snapshot: false,
+     // Core's human-question tool waits up to five minutes. This request budget
+@@ -213,6 +230,30 @@ export function buildOpenCodeConfig(
+     experimental: { mcp_timeout: 330_000 },
+     // The runner renders this file once per turn. Native steps, compaction
+     // continuation and Task children reread it through the instructions pipeline.
+-    instructions: [`${AGENT_DIR}/CLAUDE.md`, `${AGENT_DIR}/CLAUDE.local.md`, openCodeInstructionsPath()],
++    instructions: options.utilityMode
++      ? []
++      : [
++          runtimeLayout().instructions || `${AGENT_DIR}/CLAUDE.md`,
++          `${AGENT_DIR}/CLAUDE.local.md`,
++          openCodeInstructionsPath(),
++        ],
+   };
+ }
++
++function nativeOpenCodePermissions(): Record<string, string> {
++  const base = resolveOpenCodeExecutionPolicy() as Record<string, string>;
++  const permissions: Record<string, string> = {
++    '*': runtimeLayout().executionPolicy?.tools.default === 'deny' ? 'deny' : 'allow',
++  };
++  for (const [name, value] of Object.entries(base))
++    permissions[name] = value === 'deny' ? 'deny' : runtimeToolAllowed(`builtin:${name}`) ? 'allow' : 'deny';
++  const policy = runtimeLayout().executionPolicy!;
++  for (const rule of [...policy.tools.allow, ...policy.tools.deny]) {
++    if (rule.startsWith('mcp:')) {
++      const [, server, ...tool] = rule.split(':');
++      const native = server + '_' + tool.join(':');
++      permissions[native] = runtimeToolAllowed(rule) ? 'allow' : 'deny';
++    }
++  }
++  return permissions;
++}
+diff --git a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-memory.ts b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-memory.ts
+index 5c25ccd..749c510 100644
+--- a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-memory.ts
++++ b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-memory.ts
+@@ -1,6 +1,6 @@
+ import { spawn } from 'child_process';
+ import { mkdirSync, renameSync, writeFileSync } from 'fs';
+-import { homedir } from 'os';
++import { sessionInstructionsPath } from '../instruction-context.js';
+ import path from 'path';
+ import { randomUUID } from 'crypto';
+ 
+@@ -9,7 +9,7 @@ function log(message: string): void {
+ }
+ 
+ export function openCodeInstructionsPath(): string {
+-  return path.resolve(process.env.XDG_DATA_HOME || path.join(homedir(), '.local', 'share'), 'nanoclaw-instructions.md');
++  return sessionInstructionsPath();
+ }
+ 
+ /** Refresh under the turn lock. Native steps and Task children reread this file. */
+diff --git a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-turn.ts b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-turn.ts
+index 1eb201e..fdb26c9 100644
+--- a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-turn.ts
++++ b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode-turn.ts
+@@ -1,4 +1,5 @@
+ import { randomBytes } from 'crypto';
++import type { ProviderEvent } from './types.js';
+ 
+ export interface OpenCodeEvent {
+   type: string;
+@@ -32,7 +33,7 @@ export interface OpenCodeSessionClient {
+   create(params?: { signal?: AbortSignal }): Promise<{ data?: { id?: string }; error?: unknown }>;
+   prompt(params: {
+     path: { id: string };
+-    body: { messageID: string; parts: unknown[]; model?: OpenCodePromptModel };
++    body: { messageID: string; parts: unknown[]; model?: OpenCodePromptModel; system?: string };
+     signal?: AbortSignal;
+   }): Promise<{ data?: OpenCodeMessage; error?: unknown }>;
+   messages(params: {
+@@ -170,6 +171,7 @@ export async function* executeOpenCodeTurn(options: {
+   pump: OpenCodeEventPump;
+   sessionId: string;
+   parts: unknown[];
++  system?: string;
+   /** Sent with every prompt: a resumed session otherwise keeps the model it was created with. */
+   model?: OpenCodePromptModel;
+   signal: AbortSignal;
+@@ -177,7 +179,7 @@ export async function* executeOpenCodeTurn(options: {
+   idleMs: number;
+   prepare?(): void | Promise<void>;
+   discard(): void;
+-}): AsyncGenerator<{ type: 'activity' } | { type: 'error'; message: string; retryable: false }, OpenCodeTurnResult> {
++}): AsyncGenerator<ProviderEvent, OpenCodeTurnResult> {
+   const { client, pump, sessionId, signal } = options;
+   const release = await acquireOpenCodeTurn(options.runtime, signal);
+   const request = new AbortController();
+@@ -187,6 +189,7 @@ export async function* executeOpenCodeTurn(options: {
+   let streamSilent = false;
+   let failure: Error | undefined;
+   let activity = false;
++  const displayEvents: ProviderEvent[] = [];
+   let lastActivityAt = Date.now();
+   let wake: (() => void) | undefined;
+   const fail = (error: Error) => {
+@@ -205,6 +208,16 @@ export async function* executeOpenCodeTurn(options: {
+     // an independent limit that can cut off a recoverable native request.
+     // Only the synchronous response determines whether this turn succeeded.
+     if (event.type === 'session.idle' || event.type === 'session.error') return;
++    if (event.type === 'message.part.delta' && properties.field === 'text' && typeof properties.delta === 'string') {
++      displayEvents.push({ type: 'display', kind: 'text-delta', id: String(properties.partID), data: { delta: properties.delta } });
++    }
++    if (event.type === 'message.part.updated') {
++      const part = properties.part as {id?: string; type?: string; tool?: string; state?: Record<string, unknown>} | undefined;
++      if (part?.type === 'tool') {
++        const state = part.state ?? {};
++        displayEvents.push({ type: 'display', kind: 'tool', id: String(part.id), data: { name: part.tool, status: state.status, input: state.input, output: state.output, error: state.error } });
++      }
++    }
+     activity = true;
+     lastActivityAt = Date.now();
+     wake?.();
+@@ -238,7 +251,7 @@ export async function* executeOpenCodeTurn(options: {
+     started = true;
+     promptRequest = client.prompt({
+       path: { id: sessionId },
+-      body: { messageID: messageId, parts: options.parts, ...(options.model ? { model: options.model } : {}) },
++      body: { messageID: messageId, parts: options.parts, ...(options.system ? { system: options.system } : {}), ...(options.model ? { model: options.model } : {}) },
+       signal: request.signal,
+     });
+     void promptRequest.then(
+@@ -253,6 +266,7 @@ export async function* executeOpenCodeTurn(options: {
+       },
+     );
+     while (!finished && !failure) {
++      while (displayEvents.length) yield displayEvents.shift()!;
+       if (activity) {
+         activity = false;
+         yield { type: 'activity' };
+@@ -263,6 +277,7 @@ export async function* executeOpenCodeTurn(options: {
+       });
+       wake = undefined;
+     }
++    while (displayEvents.length) yield displayEvents.shift()!;
+     if (failure) throw failure;
+     if (response?.error) throw openCodeError(response.error);
+     if (!response?.data) throw new Error('OpenCode prompt returned no completed assistant');
+diff --git a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.config.test.ts b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.config.test.ts
+index 9988726..6146c32 100644
+--- a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.config.test.ts
++++ b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.config.test.ts
+@@ -1,9 +1,10 @@
+-import { describe, it, expect, afterEach } from 'bun:test';
++import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+ 
+ import { buildOpenCodeConfig, resolveOpenCodePromptModel } from './opencode-config.js';
+ 
+ const ENV_KEYS = [
+   'OPENCODE_PROVIDER',
++  'OPENCODE_API_TYPE',
+   'OPENCODE_MODEL',
+   'OPENCODE_SMALL_MODEL',
+   'ANTHROPIC_BASE_URL',
+@@ -13,6 +14,9 @@ const ENV_KEYS = [
+   'OPENCODE_MODEL_INPUT_MODALITIES',
+ ] as const;
+ const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
++beforeEach(() => {
++  for (const key of ENV_KEYS) delete process.env[key];
++});
+ afterEach(() => {
+   for (const k of ENV_KEYS) {
+     if (saved[k] === undefined) delete process.env[k];
+@@ -40,6 +44,33 @@ describe('resolveOpenCodePromptModel', () => {
+ });
+ 
+ describe('buildOpenCodeConfig provider transport', () => {
++  for (const [apiType,npm] of [['anthropic','@ai-sdk/anthropic'],['openai-responses','@ai-sdk/openai']] as const) {
++    it(`uses the explicit ${apiType} transport for a custom alias`,()=>{
++      process.env.OPENCODE_PROVIDER='custom';process.env.OPENCODE_MODEL='custom/model';process.env.OPENCODE_API_TYPE=apiType;
++      expect(buildOpenCodeConfig({}).provider).toMatchObject({custom:{npm}});
++    });
++  }
++
++  it('keeps a custom connection alias independent of the compatible API transport', () => {
++    process.env.OPENCODE_PROVIDER = 'byteplus';
++    process.env.OPENCODE_API_TYPE = 'openai-compatible';
++    process.env.OPENCODE_MODEL = 'byteplus/glm-5.2';
++    process.env.OPENCODE_SMALL_MODEL = 'byteplus/glm-5.2';
++    process.env.OPENCODE_BASE_URL = 'https://ark.ap-southeast.bytepluses.com/api/coding/v3';
++    const config = buildOpenCodeConfig({});
++    expect(config.model).toBe('byteplus/glm-5.2');
++    expect(config.provider).toMatchObject({byteplus: {
++      npm: '@ai-sdk/openai-compatible',
++      options: {baseURL: process.env.OPENCODE_BASE_URL},
++      models: {'glm-5.2': {id: 'glm-5.2'}},
++    }});
++    expect(config.provider).not.toHaveProperty('openai');
++    expect(resolveOpenCodePromptModel({model: config.model})).toEqual({providerID:'byteplus',modelID:'glm-5.2'});
++  });
++  it('rejects an unrecognized API type instead of guessing a transport', () => {
++    process.env.OPENCODE_API_TYPE = 'typo';
++    expect(() => buildOpenCodeConfig({})).toThrow('OPENCODE_API_TYPE');
++  });
+   it('allows the core five-minute human-question window plus transport overhead', () => {
+     expect(buildOpenCodeConfig({}).experimental).toMatchObject({ mcp_timeout: 330_000 });
+   });
+diff --git a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.native.test.ts b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.native.test.ts
+index 34464c5..645009e 100644
+--- a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.native.test.ts
++++ b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.native.test.ts
+@@ -19,7 +19,7 @@ it.skipIf(!process.env.OPENCODE_TEST_BINARY)(
+   'runs native turns, compaction, inherited memory, cancellation and a 65-second MCP call',
+   async () => {
+     const binary = process.env.OPENCODE_TEST_BINARY!;
+-    assert.equal(execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(), '1.18.25');
++    assert.equal(execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(), '1.19.4');
+     const savedDataHome = process.env.XDG_DATA_HOME;
+     const root = mkdtempSync(path.join(tmpdir(), 'opencode-native-'));
+     const records: unknown[] = [];
+diff --git a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.ts b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.ts
+index 7f849c7..36b157e 100644
+--- a/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.ts
++++ b/.claude/skills/add-opencode/payload/container/agent-runner/src/providers/opencode.ts
+@@ -1,3 +1,6 @@
++import { nativeInstructionContext } from '../instruction-context.js';
++import fs from 'node:fs';
++import { runtimeLayout, runtimeToolAllowed } from '../runtime-layout.js';
+ import { initializeOpenCodeAuth } from './opencode-auth.js';
+ import { spawn, type ChildProcess } from 'child_process';
+ 
+@@ -41,7 +44,7 @@ function log(msg: string): void {
+ const DEFAULT_STREAM_SILENCE_MS = 60_000;
+ const DEFAULT_IDLE_TIMEOUT_MS = 900_000;
+ 
+-const AGENT_DIR = '/workspace/agent';
++const AGENT_DIR = runtimeLayout().agent;
+ 
+ /** Native session lookup errors invalidate a stored continuation; backend/network failures do not. */
+ const STALE_SESSION_RE = /"name":"NotFoundError"/;
+@@ -71,8 +74,8 @@ export function spawnOpencodeServer(
+   return new Promise((resolve, reject) => {
+     initializeOpenCodeAuth(process.env.XDG_DATA_HOME ?? '/opencode-xdg', process.env.OPENCODE_AUTH_MODE);
+     const hostname = '127.0.0.1';
+-    const port = 4096;
+-    const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
++    const port = Number(process.env.NANOCLAW_PROVIDER_PORT || 4096);
++    const proc = spawn(runtimeLayout().executables.opencode, ['serve', `--hostname=${hostname}`, `--port=${port}`], {
+       // `opencode serve` has no directory flag. Its cwd is the project root
+       // used by native document discovery and built-in filesystem tools.
+       cwd: AGENT_DIR,
+@@ -82,14 +85,24 @@ export function spawnOpencodeServer(
+ 
+     const id = setTimeout(() => {
+       killProcessTree(proc);
+-      reject(new Error(`Timeout waiting for OpenCode server to start after ${timeoutMs}ms`));
++      reject(
++        new Error(
++          `Timeout waiting for OpenCode server to start after ${timeoutMs}ms${runtimeLayout().kind === 'native' ? '; see the private OpenCode startup.log' : ''}`,
++        ),
++      );
+     }, timeoutMs);
+ 
+     let output = '';
++    const startupLog =
++      runtimeLayout().kind === 'native' ? `${process.env.XDG_DATA_HOME}/opencode/startup.log` : undefined;
++    const capture = (chunk: Buffer) => {
++      if (startupLog) fs.appendFileSync(startupLog, chunk, { mode: 0o600 });
++    };
+     proc.stdout?.on('data', (chunk: Buffer) => {
++      capture(chunk);
+       output += chunk.toString();
+       for (const line of output.split('\n')) {
+-        if (line.startsWith('opencode server listening')) {
++        if (/^(?:opencode )?server listening on /.test(line)) {
+           const match = line.match(/on\s+(https?:\/\/[^\s]+)/);
+           if (match) {
+             clearTimeout(id);
+@@ -99,6 +112,7 @@ export function spawnOpencodeServer(
+       }
+     });
+     proc.stderr?.on('data', (chunk: Buffer) => {
++      capture(chunk);
+       output += chunk.toString();
+     });
+     proc.on('exit', (code) => {
+@@ -137,7 +151,7 @@ type OpenCodeEvent = { type: string; properties: Record<string, unknown> };
+ /**
+  * The subset of the SDK's SSE options this module drives. `subscribe` spreads
+  * them through `get.sse` → `beforeRequest` → `createSseClient` (verified in
+- * @opencode-ai/sdk 1.18.25 dist/gen). Without a `signal`, that client swallows
++ * @opencode-ai/sdk 1.19.4 dist/gen). Without a `signal`, that client swallows
+  * a closed socket and reconnects forever with backoff, so a killed server
+  * never ends the stream and an in-flight turn never learns it died.
+  */
+@@ -196,8 +210,13 @@ const defaultSharedRuntimeDeps: OpenCodeSharedRuntimeDeps = {
+   // `unknown[]` so fakes stay light, while the SDK types them as its part
+   // union. Every call site passes a text part, which is in the SDK's own
+   // union, so the runtime shapes agree.
+-  createClient: (url, cwd) => createOpencodeClient({ baseUrl: url, directory: cwd }) as unknown as SharedRuntimeClient,
+-  createQuestionClient: (url) => createOpencodeQuestionClient({ baseUrl: url }),
++  createClient: (url, cwd) =>
++    createOpencodeClient({
++      baseUrl: url,
++      directory: cwd,
++      headers: nativeServerHeaders(),
++    }) as unknown as SharedRuntimeClient,
++  createQuestionClient: (url) => createOpencodeQuestionClient({ baseUrl: url, headers: nativeServerHeaders() }),
+ };
+ 
+ let sharedRuntimeDeps: OpenCodeSharedRuntimeDeps = defaultSharedRuntimeDeps;
+@@ -242,7 +261,7 @@ async function ensureSharedRuntime(
+     // server socket and prevents reconnection, waking a parked next() so an
+     // active turn can report stream termination.
+     const streamAbort = new AbortController();
+-    // SDK 1.18.25's abort handler does not handle reader.cancel() rejection.
++    // SDK 1.19.4's abort handler does not handle reader.cancel() rejection.
+     // Cancel the fetch only after its reader listener is gone. A separate
+     // signal wakes retry backoff immediately when teardown was requested.
+     const releaseAbort = new AbortController();
+@@ -525,13 +544,20 @@ function eventPump(runtime: OpenCodeRuntimeHandle): OpenCodeEventPump {
+         void handleQuestionAsked(runtime.questionClient, event.properties);
+       }
+       if (event.type === 'permission.updated') {
+-        const permission = event.properties as { id?: string; sessionID?: string };
++        const permission = event.properties as { id?: string; sessionID?: string; permission?: string };
+         if (permission.id && permission.sessionID) {
+           void boundedOpenCodeCall(
+             () =>
+               runtime.client.postSessionIdPermissionsPermissionId?.({
+                 path: { id: permission.sessionID!, permissionID: permission.id! },
+-                body: { response: 'always' },
++                body: {
++                  response:
++                    runtimeLayout().kind === 'native'
++                      ? permission.permission && runtimeToolAllowed(`builtin:${permission.permission}`)
++                        ? 'once'
++                        : 'reject'
++                      : 'always',
++                },
+               }) ?? Promise.resolve(),
+           ).catch(() => log('Failed to auto-reply OpenCode permission'));
+         }
+@@ -611,10 +637,12 @@ export class OpenCodeProvider implements AgentProvider {
+             sessionId,
+             parts: [{ type: 'text', text: turn }],
+             model: promptModel,
++            system: input.utility ? input.systemContext?.instructions : undefined,
+             prepare: async () => {
++              if (input.utility) return;
+               await prepareOpenCodeMemory(
+                 self.memorySessionHook!,
+-                input.systemContext?.instructions,
++                [nativeInstructionContext(input.cwd, 'opencode'), input.systemContext?.instructions].filter(Boolean).join('\n\n'),
+                 buildDeliverySentences(
+                   getAllDestinations().map((destination) => destination.name),
+                   getTaskSeriesId(),
+@@ -658,3 +686,9 @@ export class OpenCodeProvider implements AgentProvider {
+ }
+ 
+ registerProvider('opencode', (opts, configuration) => new OpenCodeProvider(opts, undefined, configuration));
++
++function nativeServerHeaders(): Record<string, string> {
++  return process.env.OPENCODE_SERVER_PASSWORD
++    ? { Authorization: `Basic ${Buffer.from('opencode:' + process.env.OPENCODE_SERVER_PASSWORD).toString('base64')}` }
++    : {};
++}
+diff --git a/.claude/skills/add-opencode/payload/scripts/opencode-auth.test.ts b/.claude/skills/add-opencode/payload/scripts/opencode-auth.test.ts
+index 77d0088..4d37934 100644
+--- a/.claude/skills/add-opencode/payload/scripts/opencode-auth.test.ts
++++ b/.claude/skills/add-opencode/payload/scripts/opencode-auth.test.ts
+@@ -215,8 +215,8 @@ describe('OpenCode setup payload', () => {
+       dependencies?: Record<string, string>;
+     };
+     const cli = tools.find((entry) => entry.name === 'opencode-ai');
+-    expect(cli).toEqual({ name: 'opencode-ai', version: '1.18.25', onlyBuilt: true });
+-    expect(runner.dependencies?.['@opencode-ai/sdk']).toBe('1.18.25');
++    expect(cli).toEqual({ name: 'opencode-ai', version: '1.19.4', onlyBuilt: true });
++    expect(runner.dependencies?.['@opencode-ai/sdk']).toBe('1.19.4');
+   });
+ });
+ 
+@@ -392,11 +392,11 @@ describe('OpenCode installation declarations', () => {
+     fs.cpSync(path.join(skill, 'payload'), root, { recursive: true });
+     fs.writeFileSync(
+       path.join(root, 'container/cli-tools.json'),
+-      JSON.stringify([{ name: 'opencode-ai', version: '1.18.25', onlyBuilt: true }]),
++      JSON.stringify([{ name: 'opencode-ai', version: '1.19.4', onlyBuilt: true }]),
+     );
+     fs.writeFileSync(
+       path.join(root, 'container/agent-runner/package.json'),
+-      JSON.stringify({ dependencies: { '@opencode-ai/sdk': '1.18.25' } }),
++      JSON.stringify({ dependencies: { '@opencode-ai/sdk': '1.19.4' } }),
+     );
+     for (const barrel of [
+       'src/providers/index.ts',
+@@ -443,13 +443,13 @@ describe('OpenCode installation declarations', () => {
+   });
+   it.each([
+     { version: '1.4.17', onlyBuilt: true },
+-    { version: '1.18.25', onlyBuilt: false },
++    { version: '1.19.4', onlyBuilt: false },
+   ])('checks declared CLI fields: %j', async (fields) => {
+     fs.writeFileSync(path.join(root, 'container/cli-tools.json'), JSON.stringify([{ name: 'opencode-ai', ...fields }]));
+     await expect(checkOpenCodeInstall()).rejects.toThrow('declaration');
+   });
+   it('takes dependency and CLI pins from the skill instead of duplicating version constants', async () => {
+-    fs.writeFileSync(skillFile, fs.readFileSync(skillFile, 'utf8').replaceAll('1.18.25', '9.9.9'));
++    fs.writeFileSync(skillFile, fs.readFileSync(skillFile, 'utf8').replaceAll('1.19.4', '9.9.9'));
+     fs.writeFileSync(
+       path.join(root, 'container/agent-runner/package.json'),
+       JSON.stringify({ dependencies: { '@opencode-ai/sdk': '9.9.9' } }),
+diff --git a/.claude/skills/add-opencode/payload/scripts/opencode-host.test.ts b/.claude/skills/add-opencode/payload/scripts/opencode-host.test.ts
+index baad5a0..4861829 100644
+--- a/.claude/skills/add-opencode/payload/scripts/opencode-host.test.ts
++++ b/.claude/skills/add-opencode/payload/scripts/opencode-host.test.ts
+@@ -80,10 +80,10 @@ describe('native host OpenCode lifecycle', () => {
+     touch(config, '{"model":"user/chosen-model"}');
+     edge.spawnSync.mockImplementation((_binary: string, args: string[]) => ({
+       status: 0,
+-      stdout: args[0] === '--help' ? '      --prompt        prompt to use [string]' : '1.18.26',
++      stdout: args[0] === '--help' ? '      --prompt        prompt to use [string]' : '1.19.5',
+     }));
+     expect(await hostOpenCode.prepare(root)).toBe('available');
+-    expect(findHostOpenCode(root)).toEqual({ binary, version: '1.18.26' });
++    expect(findHostOpenCode(root)).toEqual({ binary, version: '1.19.5' });
+     expect(fs.readFileSync(binary, 'utf8')).toBe('existing binary');
+     expect(fs.readFileSync(config, 'utf8')).toBe('{"model":"user/chosen-model"}');
+     expect(edge.spawn).not.toHaveBeenCalled();
+@@ -96,7 +96,7 @@ describe('native host OpenCode lifecycle', () => {
+     expect(findHostOpenCode(root)).toBeUndefined();
+     edge.spawnSync.mockImplementation((_binary: string, args: string[]) => ({
+       status: 0,
+-      stdout: args[0] === '--help' ? 'Usage: opencode [project]' : '1.18.25',
++      stdout: args[0] === '--help' ? 'Usage: opencode [project]' : '1.19.4',
+     }));
+     expect(findHostOpenCode(root)).toBeUndefined();
+   });
+@@ -139,10 +139,10 @@ describe('native host OpenCode lifecycle', () => {
+         args[0] === '--help'
+           ? '      --prompt        prompt to use [string]'
+           : binary === native
+-            ? '1.19.0'
+-            : '1.18.25',
++            ? '1.20.0'
++            : '1.19.4',
+     }));
+-    expect(findHostOpenCode(root)).toEqual({ binary: native, version: '1.19.0' });
++    expect(findHostOpenCode(root)).toEqual({ binary: native, version: '1.20.0' });
+   });
+ 
+   it('installs the exact CLI and runs only its native linker inside this checkout', async () => {
+diff --git a/.claude/skills/add-opencode/payload/scripts/opencode-host.ts b/.claude/skills/add-opencode/payload/scripts/opencode-host.ts
+index abc6de3..3e14b96 100644
+--- a/.claude/skills/add-opencode/payload/scripts/opencode-host.ts
++++ b/.claude/skills/add-opencode/payload/scripts/opencode-host.ts
+@@ -8,7 +8,7 @@ import * as p from '@clack/prompts';
+ 
+ import { pathToFileURL } from 'url';
+ 
+-export const OPENCODE_HOST_INSTALL_VERSION = '1.18.25';
++export const OPENCODE_HOST_INSTALL_VERSION = '1.19.4';
+ 
+ function managedBinary(root: string): string {
+   return path.join(root, 'data', 'host-harness', 'opencode', 'node_modules', '.bin', 'opencode');
+diff --git a/.claude/skills/add-opencode/payload/scripts/opencode-vault.ts b/.claude/skills/add-opencode/payload/scripts/opencode-vault.ts
+index 7c9e738..deb0f03 100644
+--- a/.claude/skills/add-opencode/payload/scripts/opencode-vault.ts
++++ b/.claude/skills/add-opencode/payload/scripts/opencode-vault.ts
+@@ -43,7 +43,7 @@ export function createOpenCodeVault(target: OpenCodeSecret, root = process.cwd()
+   };
+ }
+ 
+-// Matches the native OpenAI plugin in the skill-pinned OpenCode 1.18.25.
++// Matches the native OpenAI plugin in the skill-pinned OpenCode 1.19.4.
+ export const CHATGPT_SECRET: OpenCodeSecret = {
+   name: 'OpenCode ChatGPT',
+   kind: 'oauth',
+diff --git a/.claude/skills/add-opencode/payload/src/providers/opencode-registration.test.ts b/.claude/skills/add-opencode/payload/src/providers/opencode-registration.test.ts
+index 918fcaf..0385403 100644
+--- a/.claude/skills/add-opencode/payload/src/providers/opencode-registration.test.ts
++++ b/.claude/skills/add-opencode/payload/src/providers/opencode-registration.test.ts
+@@ -43,10 +43,10 @@ describe('OpenCode host payload', () => {
+       fs.readFileSync(new URL('../../container/agent-runner/package.json', import.meta.url), 'utf8'),
+     );
+     expect(tools.find((entry: { name: string }) => entry.name === 'opencode-ai')).toMatchObject({
+-      version: '1.18.25',
++      version: '1.19.4',
+       onlyBuilt: true,
+     });
+-    expect(runner.dependencies['@opencode-ai/sdk']).toBe('1.18.25');
++    expect(runner.dependencies['@opencode-ai/sdk']).toBe('1.19.4');
+   });
+   it('registers the implementation and version 1 surfaces through the actual barrels', () => {
+     expect(getProviderContainerConfig('opencode')).toBeTypeOf('function');
+diff --git a/.claude/skills/add-opencode/payload/src/providers/opencode.ts b/.claude/skills/add-opencode/payload/src/providers/opencode.ts
+index 5492c0e..ea90a9c 100644
+--- a/.claude/skills/add-opencode/payload/src/providers/opencode.ts
++++ b/.claude/skills/add-opencode/payload/src/providers/opencode.ts
+@@ -12,10 +12,12 @@ import fs from 'fs';
+ import path from 'path';
+ 
+ import { readEnvFile } from '../env.js';
++import { connectionForModel } from '../model-connections.js';
+ import { registerProviderContainerConfig } from './provider-container-registry.js';
+ 
+ const PASSTHROUGH_KEYS = [
+   'OPENCODE_PROVIDER',
++  'OPENCODE_API_TYPE',
+   'OPENCODE_MODEL',
+   'OPENCODE_SMALL_MODEL',
+   'OPENCODE_BASE_URL',
+@@ -41,7 +43,7 @@ function mergeNoProxy(current: string | undefined, additions: string): string {
+   return [...parts].join(',');
+ }
+ 
+-registerProviderContainerConfig('opencode', (ctx) => {
++registerProviderContainerConfig('opencode', async (ctx) => {
+   const opencodeDir = path.join(ctx.sessionDir, 'opencode-xdg');
+   if (!ctx.coreOwnsProviderSurfaces) fs.mkdirSync(opencodeDir, { recursive: true });
+ 
+@@ -61,14 +63,28 @@ registerProviderContainerConfig('opencode', (ctx) => {
+     if (value) env[key] = value;
+   }
+ 
++  const connection = ctx.model ? await connectionForModel(ctx.model) : undefined;
++  if (connection) {
++    const model = connection.models.find(m => ctx.model === `${connection.id}/${m.id}`);
++    if (!model) throw new Error('Add this model and its token limits in API connections before using it.');
++    Object.assign(env, {
++      OPENCODE_PROVIDER: connection.id, OPENCODE_API_TYPE: connection.apiType,
++      OPENCODE_MODEL: ctx.model, OPENCODE_SMALL_MODEL: ctx.model,
++      OPENCODE_BASE_URL: connection.endpoint,
++      OPENCODE_MODEL_CONTEXT_LIMIT: String(model.context), OPENCODE_MODEL_OUTPUT_LIMIT: String(model.output),
++      OPENCODE_MODEL_INPUT_MODALITIES: model.image ? 'text,image' : 'text',
++    });
++  }
++
+   const mounts = ctx.coreOwnsProviderSurfaces
+     ? []
+     : [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }];
+   const authMode: string | undefined = ctx.hostEnv[AUTH_MODE_KEY] ?? dotenv[AUTH_MODE_KEY];
+   // The container initializes its own non-secret auth state before server startup.
+-  env[AUTH_MODE_KEY] = authMode === 'chatgpt' ? 'chatgpt' : 'api-key';
++  env[AUTH_MODE_KEY] = !connection && authMode === 'chatgpt' ? 'chatgpt' : 'api-key';
+ 
+   return {
++    ...(connection ? { modelEndpoint: connection.endpoint } : {}),
+     mounts,
+     env,
+   };
+diff --git a/container/agent-runner/src/cli/ncl.ts b/container/agent-runner/src/cli/ncl.ts
+index e242538..0618879 100644
+--- a/container/agent-runner/src/cli/ncl.ts
++++ b/container/agent-runner/src/cli/ncl.ts
+@@ -10,7 +10,7 @@
+  */
+ import '../modules/index.js';
+ import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
+-import type { AgentMailbox } from '../mailbox/types.js';
++import { requestHost, type HostReply as ResponseFrame } from '../mailbox/request.js';
+ 
+ import { readStdinJsonArgs, StdinJsonInputError } from './stdin-json.js';
+ 
+@@ -18,65 +18,8 @@ import { readStdinJsonArgs, StdinJsonInputError } from './stdin-json.js';
+ // Frame types (mirrors src/cli/frame.ts on the host)
+ // ---------------------------------------------------------------------------
+ 
+-type RequestFrame = {
+-  id: string;
+-  command: string;
+-  args: Record<string, unknown>;
+-};
+-
+-type ResponseFrame =
+-  // `human` mirrors src/cli/frame.ts: an optional server-rendered string we
+-  // print verbatim instead of running our own (drift-prone) formatter.
+-  | { id: string; ok: true; data: unknown; human?: string }
+-  | { id: string; ok: false; error: { code: string; message: string } };
+-
+-// ---------------------------------------------------------------------------
+-// Mailbox transport
+-// ---------------------------------------------------------------------------
+-
+ function generateId(): string {
+-  return `cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+-}
+-
+-/**
+- * Write a cli_request through the registered mailbox.
+- */
+-async function writeRequest(mailbox: AgentMailbox, req: RequestFrame): Promise<void> {
+-  await mailbox.run(() =>
+-    mailbox.operations.writeMessageOut({
+-      id: req.id,
+-      kind: 'system',
+-      content: JSON.stringify({
+-        action: 'cli_request',
+-        requestId: req.id,
+-        command: req.command,
+-        args: req.args,
+-      }),
+-    }),
+-  );
+-}
+-
+-/**
+- * Poll the mailbox for a cli_response matching our requestId.
+- */
+-async function pollResponse(mailbox: AgentMailbox, requestId: string, timeoutMs: number): Promise<ResponseFrame | null> {
+-  const deadline = Date.now() + timeoutMs;
+-
+-  while (Date.now() < deadline) {
+-    const response = await mailbox.run(() => {
+-      const row = mailbox.operations.findCliResponse(requestId);
+-      if (row) {
+-        mailbox.operations.markMessages([row.id], 'completed');
+-        return (JSON.parse(row.content) as { frame: ResponseFrame }).frame;
+-      }
+-      return null;
+-    });
+-    if (response) return response;
+-
+-    await Bun.sleep(500);
+-  }
+-
+-  return null;
++  return `cli-${crypto.randomUUID()}`;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -211,9 +154,7 @@ function formatHuman(resp: ResponseFrame): string {
+   const header = keys.map((k, i) => k.padEnd(widths[i])).join('  ');
+   const sep = widths.map((w) => '-'.repeat(w)).join('  ');
+   const rows = data.map((r) =>
+-    keys
+-      .map((k, i) => String((r as Record<string, unknown>)[k] ?? '').padEnd(widths[i]))
+-      .join('  '),
++    keys.map((k, i) => String((r as Record<string, unknown>)[k] ?? '').padEnd(widths[i])).join('  '),
+   );
+ 
+   return [header, sep, ...rows, ''].join('\n');
+@@ -254,8 +195,7 @@ async function main(): Promise<void> {
+   await mailbox.start(context);
+   try {
+     const requestId = generateId();
+-    await writeRequest(mailbox, { id: requestId, command, args: requestArgs });
+-    const resp = await pollResponse(mailbox, requestId, 30_000);
++    const resp = await requestHost(mailbox, requestId, 'cli_request', { command, args: requestArgs });
+ 
+     if (!resp) {
+       process.stderr.write('ncl: command timed out after 30s\n');
+diff --git a/container/agent-runner/src/config.ts b/container/agent-runner/src/config.ts
+index 6aad079..acdeda9 100644
+--- a/container/agent-runner/src/config.ts
++++ b/container/agent-runner/src/config.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from './runtime-layout.js';
+ /**
+  * Runner config — reads /workspace/agent/container.json at startup.
+  *
+@@ -9,7 +10,7 @@ import fs from 'fs';
+ 
+ import type { McpServerConfig, ProviderSpeed } from './providers/types.js';
+ 
+-const CONFIG_PATH = '/workspace/agent/container.json';
++const CONFIG_PATH = runtimeLayout().config;
+ 
+ export interface RunnerConfig {
+   provider: string;
+@@ -21,6 +22,8 @@ export interface RunnerConfig {
+   model?: string;
+   effort?: string;
+   speed?: ProviderSpeed;
++  workspaceWorkingDirectory?: string;
++  workspaceUtility?: boolean;
+ }
+ 
+ const DEFAULT_MAX_MESSAGES = 10;
+@@ -37,7 +40,8 @@ export function loadConfig(): RunnerConfig {
+   let raw: Record<string, unknown> = {};
+   try {
+     raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+-  } catch {
++  } catch (error) {
++    if (runtimeLayout().kind === 'native') throw new Error(`Cannot read native runner configuration: ${CONFIG_PATH}`, { cause: error });
+     console.error(`[config] Failed to read ${CONFIG_PATH}, using defaults`);
+   }
+ 
+@@ -49,6 +53,8 @@ export function loadConfig(): RunnerConfig {
+ /** Build the runner config from a parsed container.json; missing fields take their defaults. */
+ export function runnerConfigFromRaw(raw: Record<string, unknown>): RunnerConfig {
+   return {
++    workspaceWorkingDirectory: typeof raw.workspaceWorkingDirectory === 'string' ? raw.workspaceWorkingDirectory : undefined,
++    workspaceUtility: raw.workspaceUtility === true,
+     provider: (raw.provider as string) || 'claude',
+     assistantName: (raw.assistantName as string) || '',
+     groupName: (raw.groupName as string) || '',
+diff --git a/container/agent-runner/src/formatter.ts b/container/agent-runner/src/formatter.ts
+index 6ef87ab..0d4275b 100644
+--- a/container/agent-runner/src/formatter.ts
++++ b/container/agent-runner/src/formatter.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from './runtime-layout.js';
+ import { findByRouting } from './destinations.js';
+ import type { MessageInRow } from './db/messages-in.js';
+ import { TIMEZONE, formatLocalTime, formatLocalStamp } from './timezone.js';
+@@ -421,7 +422,7 @@ function formatAttachments(attachments: any[] | undefined): string {
+   const parts = attachments.map((a) => {
+     const name = a.name || a.filename || 'attachment';
+     const type = a.type || 'file';
+-    const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
++    const localPath = a.localPath ? `${runtimeLayout().session}/${a.localPath}` : '';
+     const url = a.url || '';
+     if (localPath) {
+       return `[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`;
+diff --git a/container/agent-runner/src/heartbeat.ts b/container/agent-runner/src/heartbeat.ts
+index 9137da5..794453c 100644
+--- a/container/agent-runner/src/heartbeat.ts
++++ b/container/agent-runner/src/heartbeat.ts
+@@ -1,6 +1,7 @@
++import { runtimeLayout } from './runtime-layout.js';
+ import fs from 'fs';
+ 
+-const DEFAULT_HEARTBEAT_PATH = '/workspace/.heartbeat';
++const DEFAULT_HEARTBEAT_PATH = `${runtimeLayout().session}/.heartbeat`;
+ 
+ /**
+  * The heartbeat location is deployment-configurable via
+diff --git a/container/agent-runner/src/index.ts b/container/agent-runner/src/index.ts
+index 811a583..cc9ef40 100644
+--- a/container/agent-runner/src/index.ts
++++ b/container/agent-runner/src/index.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from './runtime-layout.js';
+ /**
+  * NanoClaw Agent Runner v2
+  *
+@@ -50,7 +51,7 @@ function log(msg: string): void {
+   console.error(`[agent-runner] ${msg}`);
+ }
+ 
+-const CWD = '/workspace/agent';
++const CWD = runtimeLayout().agent;
+ 
+ async function main(): Promise<void> {
+   const config = loadConfig();
+@@ -62,10 +63,10 @@ async function main(): Promise<void> {
+ 
+   // Every provider shares one persistent memory tree. Legacy imports are an
+   // operator-run migration and never happen in this normal startup path.
+-  ensureMemoryScaffold();
++  if (!config.workspaceUtility) ensureMemoryScaffold();
+ 
+   // The agent browser trusts only NSS, not the gateway CA env vars.
+-  trustGatewayCaForChromium({ log });
++  if (runtimeLayout().kind === 'container') trustGatewayCaForChromium({ log });
+ 
+   // Runtime-generated system-prompt addendum: agent identity (name) plus
+   // the live destinations map. Everything else (capabilities, per-module
+@@ -80,7 +81,7 @@ async function main(): Promise<void> {
+   );
+ 
+   // Discover additional directories mounted at /workspace/extra/*
+-  const additionalDirectories: string[] = [];
++  const additionalDirectories: string[] = [...runtimeLayout().additionalDirectories];
+   const extraBase = '/workspace/extra';
+   if (fs.existsSync(extraBase)) {
+     for (const entry of fs.readdirSync(extraBase)) {
+@@ -101,8 +102,8 @@ async function main(): Promise<void> {
+   // Build MCP servers config: nanoclaw built-in + any from container.json
+   const mcpServers: Record<string, McpServerConfig> = {
+     nanoclaw: {
+-      command: 'bun',
+-      args: ['run', mcpServerPath],
++      command: runtimeLayout().executables.bun,
++      args: ['run', '--no-env-file', mcpServerPath],
+       env: {},
+     },
+   };
+@@ -120,7 +121,8 @@ async function main(): Promise<void> {
+ 
+   const provider = createProvider(providerName, {
+     assistantName: config.assistantName || undefined,
+-    mcpServers,
++    utilityMode: config.workspaceUtility,
++    mcpServers: config.workspaceUtility ? {} : mcpServers,
+     env: { ...process.env },
+     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+     model: config.model,
+@@ -130,12 +132,19 @@ async function main(): Promise<void> {
+   registerProviderMemorySessionHook(providerName, provider, MEMORY_SESSION_HOOK);
+ 
+   try {
++    if (config.workspaceUtility) {
++      const { runWorkspaceUtilities } = await import('./workspace-utilities.js');
++      await runWorkspaceUtilities(provider);
++      return;
++    }
++    const cwd = config.workspaceWorkingDirectory || CWD;
++    const { agentInstructionsForWorkingDirectory } = await import('./workspace-context.js');
+     await runPollLoop({
+       provider,
+       providerContract: getProviderRuntimeContract(providerName),
+       providerName,
+-      cwd: CWD,
+-      systemContext: { instructions },
++      cwd,
++      systemContext: { instructions: [agentInstructionsForWorkingDirectory(cwd), instructions].filter(Boolean).join("\n\n") },
+     });
+   } finally {
+     await mailbox.stop();
+diff --git a/container/agent-runner/src/mailbox/index.ts b/container/agent-runner/src/mailbox/index.ts
+index 5a36326..fba45e2 100644
+--- a/container/agent-runner/src/mailbox/index.ts
++++ b/container/agent-runner/src/mailbox/index.ts
+@@ -1,6 +1,7 @@
++import { runtimeLayout } from '../runtime-layout.js';
+ import type { AgentMailbox, AgentMailboxFactory } from './types.js';
+ 
+-const SESSION_CONTEXT = '/app/.nanoclaw-session.json';
++const SESSION_CONTEXT = runtimeLayout().context;
+ 
+ let active: AgentMailbox | undefined;
+ let factory: AgentMailboxFactory | undefined;
+diff --git a/container/agent-runner/src/mailbox/sqlite/connection.ts b/container/agent-runner/src/mailbox/sqlite/connection.ts
+index 33d509b..0d095b0 100644
+--- a/container/agent-runner/src/mailbox/sqlite/connection.ts
++++ b/container/agent-runner/src/mailbox/sqlite/connection.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from '../../runtime-layout.js';
+ /**
+  * Two-DB connection layer.
+  *
+@@ -22,8 +23,8 @@
+  */
+ import { Database } from 'bun:sqlite';
+ 
+-const DEFAULT_INBOUND_PATH = '/workspace/inbound.db';
+-const DEFAULT_OUTBOUND_PATH = '/workspace/outbound.db';
++const DEFAULT_INBOUND_PATH = `${runtimeLayout().session}/inbound.db`;
++const DEFAULT_OUTBOUND_PATH = `${runtimeLayout().session}/outbound.db`;
+ 
+ let _inbound: Database | null = null;
+ let _outbound: Database | null = null;
+@@ -105,6 +106,7 @@ export function getOutboundDb(path = DEFAULT_OUTBOUND_PATH): Database {
+       );
+     }
+     _outbound.exec(`UPDATE session_state SET updated_at = '1970-01-01T00:00:00.000Z' WHERE updated_at = ''`);
++    _outbound.exec('CREATE TABLE IF NOT EXISTS workspace_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL)');
+     // container_state: tracks the current tool in flight (if any) so the host
+     // sweep can widen its stuck tolerance when Bash is running with a user-
+     // declared long timeout. Forward-compat for older outbound.db files.
+diff --git a/container/agent-runner/src/mailbox/sqlite/index.ts b/container/agent-runner/src/mailbox/sqlite/index.ts
+index ec5ef0c..14cd183 100644
+--- a/container/agent-runner/src/mailbox/sqlite/index.ts
++++ b/container/agent-runner/src/mailbox/sqlite/index.ts
+@@ -1,6 +1,7 @@
+ import {
+   closeSessionDb,
+   readInbound,
++  getOutboundDb,
+   sqliteClearContainerToolInFlight,
+   sqliteClearStaleProcessingAcks,
+   sqliteSetContainerToolInFlight,
+@@ -113,6 +114,17 @@ export class SqliteAgentMailbox implements AgentMailbox {
+     closeSessionDb();
+   }
+ 
++  workspaceContext(): { value: string; control: string | null } | null {
++    return readInbound((db) => {
++      if (!db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_context'").get()) return null;
++      return db.query('SELECT value,control FROM workspace_context WHERE id=1').get() as {value: string; control: string | null} | null;
++    });
++  }
++
++  writeWorkspaceEvent(kind: string, content: string): void {
++    getOutboundDb().query('INSERT INTO workspace_events (timestamp,kind,content) VALUES (?,?,?)').run(new Date().toISOString(),kind,content);
++  }
++
+   getPendingMessages(limit: number, isFirstPoll: boolean): InboundMessage[] {
+     return sqliteGetPendingMessages(isFirstPoll, limit).flatMap((row) => {
+       const message = parseInboundMessage(row);
+diff --git a/container/agent-runner/src/mailbox/types.ts b/container/agent-runner/src/mailbox/types.ts
+index e477362..e71d47f 100644
+--- a/container/agent-runner/src/mailbox/types.ts
++++ b/container/agent-runner/src/mailbox/types.ts
+@@ -44,6 +44,8 @@ export type OutboundMessageDraft = OutboundWrite;
+ export type StateValue = Omit<StateRecord, 'key'>;
+ 
+ export interface MailboxOperations {
++  workspaceContext?(): { value: string; control: string | null } | null;
++  writeWorkspaceEvent?(kind: string, content: string): void;
+   getPendingMessages(limit: number, isFirstPoll: boolean): InboundMessage[];
+   markMessages(ids: string[], status: ProcessingStatus): void;
+   markScriptSkipped(skips: Array<{ id: string; reason: string }>): void;
+diff --git a/container/agent-runner/src/mcp-tools/core.ts b/container/agent-runner/src/mcp-tools/core.ts
+index 1a5f69e..7f86a1d 100644
+--- a/container/agent-runner/src/mcp-tools/core.ts
++++ b/container/agent-runner/src/mcp-tools/core.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from '../runtime-layout.js';
+ /**
+  * Core MCP tools: send_message, send_file, edit_message, add_reaction.
+  *
+@@ -128,13 +129,13 @@ export const sendFile: McpToolDefinition = {
+     const routing = resolveRouting(to);
+     if ('error' in routing) return err(routing.error);
+ 
+-    const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
++    const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve(runtimeLayout().agent, filePath);
+     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
+ 
+     const id = generateId();
+     const filename = (args.filename as string) || path.basename(resolvedPath);
+ 
+-    const outboxDir = path.join('/workspace/outbox', id);
++    const outboxDir = path.join(runtimeLayout().session, 'outbox', id);
+     fs.mkdirSync(outboxDir, { recursive: true });
+     fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
+ 
+diff --git a/container/agent-runner/src/mcp-tools/index.ts b/container/agent-runner/src/mcp-tools/index.ts
+index 592bf74..f0847cf 100644
+--- a/container/agent-runner/src/mcp-tools/index.ts
++++ b/container/agent-runner/src/mcp-tools/index.ts
+@@ -9,6 +9,7 @@ import './core.js';
+ import './interactive.js';
+ import './agents.js';
+ import './self-mod.js';
++import './execution.js';
+ // Module barrel — loads registration modules, including the singular mailbox slot.
+ import '../modules/index.js';
+ import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
+diff --git a/container/agent-runner/src/mcp-tools/interactive.test.ts b/container/agent-runner/src/mcp-tools/interactive.test.ts
+index 859ee3f..8de0054 100644
+--- a/container/agent-runner/src/mcp-tools/interactive.test.ts
++++ b/container/agent-runner/src/mcp-tools/interactive.test.ts
+@@ -296,6 +296,19 @@ describe('send_card', () => {
+     }
+   });
+ 
++  it('preserves URL character acceptance with the portable DeepSeek pattern', () => {
++    const re = new RegExp(LINK_ACTION_SCHEMA.properties.url.pattern);
++    for (let code = 0; code < 128; code++) {
++      const char = String.fromCharCode(code);
++      const printable = code >= 33 && code <= 126 && char !== '"' && char !== '\\';
++      expect(re.test(`https://${char}x`)).toBe(printable && !['#', '/', '?'].includes(char));
++      expect(re.test(`https://example.com/${char}x`)).toBe(printable);
++    }
++    expect(re.test('https://[::1]:8080/path')).toBe(true);
++    // The provider rejects escaped closing brackets inside a character class.
++    expect(LINK_ACTION_SCHEMA.properties.url.pattern).not.toContain('\\]-');
++  });
++
+   it('constrains children to text instead of promising nested action blocks', () => {
+     const cardSchema = sendCard.tool.inputSchema.properties.card as {
+       properties: { children: { description: string; items: { anyOf: Array<Record<string, unknown>> } } };
+diff --git a/container/agent-runner/src/mcp-tools/interactive.ts b/container/agent-runner/src/mcp-tools/interactive.ts
+index 41ec84e..8802b81 100644
+--- a/container/agent-runner/src/mcp-tools/interactive.ts
++++ b/container/agent-runner/src/mcp-tools/interactive.ts
+@@ -73,11 +73,13 @@ export const LINK_ACTION_SCHEMA = Object.freeze({
+     // schema-to-grammar converter rejects those escapes and fails every request
+     // that carries this tool. The classes also leave out '"' and '\\', which
+     // the converter would otherwise copy into the JSON string rule. The first
+-    // host character excludes '#', '/' and '?'. Non-ASCII URLs are normalized
++    // host character excludes '#', '/' and '?'. Brackets use alternatives:
++    // BytePlus DeepSeek rejects escaped closing brackets inside character
++    // classes, even though JavaScript accepts them. Non-ASCII URLs are normalized
+     // with `new URL()` before validation (see normalizeLinkUrl).
+     url: {
+       type: 'string' as const,
+-      pattern: '^[hH][tT][tT][pP][sS]?://[!$-.0->@-[\\]-~][!#-[\\]-~]*$',
++      pattern: '^[hH][tT][tT][pP][sS]?://([!$-.0->@-Z^-~]|\\[|\\])([!#-Z^-~]|\\[|\\])*$',
+       description: "Web link (http or https), e.g. 'https://example.com'.",
+     },
+     style: {
+diff --git a/container/agent-runner/src/mcp-tools/server.ts b/container/agent-runner/src/mcp-tools/server.ts
+index 8057eb4..200ca3f 100644
+--- a/container/agent-runner/src/mcp-tools/server.ts
++++ b/container/agent-runner/src/mcp-tools/server.ts
+@@ -1,3 +1,4 @@
++import { runtimeToolAllowed } from '../runtime-layout.js';
+ /**
+  * MCP server bootstrap + tool self-registration.
+  *
+@@ -128,12 +129,13 @@ export function createMcpServer(
+   const server = new Server({ name: 'nanoclaw', version: '2.0.0' }, { capabilities: { tools: {} } });
+ 
+   server.setRequestHandler(ListToolsRequestSchema, async () => ({
+-    tools: allTools.map((t) => t.tool),
++    tools: allTools.filter(t => runtimeToolAllowed(`mcp:nanoclaw:${t.tool.name}`)).map((t) => t.tool),
+   }));
+ 
+   server.setRequestHandler(CallToolRequestSchema, async (request, context) => {
+     const { name, arguments: args } = request.params;
+     const tool = toolMap.get(name);
++    if (!runtimeToolAllowed(`mcp:nanoclaw:${name}`)) return {isError:true,content:[{type:'text',text:'Denied by NanoClaw execution policy'}]};
+     if (!tool) {
+       return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
+     }
+diff --git a/container/agent-runner/src/memory/context.ts b/container/agent-runner/src/memory/context.ts
+index 219adc4..2f9ba88 100644
+--- a/container/agent-runner/src/memory/context.ts
++++ b/container/agent-runner/src/memory/context.ts
+@@ -1,3 +1,5 @@
++import { recordMemoryContext } from '../instruction-context.js';
++import { runtimeLayout } from '../runtime-layout.js';
+ import fs from 'fs';
+ import path from 'path';
+ 
+@@ -8,18 +10,18 @@ export const MEMORY_TRUNCATION_NOTICE = '[truncated: slim this file and move det
+  * Render the two always-loaded memory files inside the container. Host-side
+  * composers never read agent-controlled memory.
+  */
+-export function renderMemorySection(baseDir = '/workspace/agent'): string {
++export function renderMemorySection(baseDir = runtimeLayout().agent): string {
+   const memoryDir = path.join(baseDir, 'memory');
+   const index = readMemoryFile(path.join(memoryDir, 'index.md'));
+   const definition = readMemoryFile(path.join(memoryDir, 'system', 'definition.md'));
+ 
+-  return [
++  const rendered = [
+     '## Memory',
+     '',
+     'These files are loaded at startup, after clear, and after compaction:',
+     '',
+-    '- `/workspace/agent/memory/index.md` - top-level memory index and Core Memory',
+-    '- `/workspace/agent/memory/system/definition.md` - memory system behavior',
++    `- \`${baseDir}/memory/index.md\` - top-level memory index and Core Memory`,
++    `- \`${baseDir}/memory/system/definition.md\` - memory system behavior`,
+     '',
+     'The files on disk are authoritative. Edit them directly; follow links from',
+     'the index when more detail is relevant.',
+@@ -37,6 +39,8 @@ export function renderMemorySection(baseDir = '/workspace/agent'): string {
+     definition,
+     '',
+   ].join('\n');
++  recordMemoryContext(rendered);
++  return rendered;
+ }
+ 
+ function readMemoryFile(filePath: string): string {
+diff --git a/container/agent-runner/src/memory/scaffold.ts b/container/agent-runner/src/memory/scaffold.ts
+index 02cd439..8e7710f 100644
+--- a/container/agent-runner/src/memory/scaffold.ts
++++ b/container/agent-runner/src/memory/scaffold.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from '../runtime-layout.js';
+ import fs from 'fs';
+ import path from 'path';
+ import { fileURLToPath } from 'url';
+@@ -20,7 +21,7 @@ import { fileURLToPath } from 'url';
+  */
+ const TEMPLATES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'templates');
+ 
+-export function ensureMemoryScaffold(baseDir = '/workspace/agent'): void {
++export function ensureMemoryScaffold(baseDir = runtimeLayout().agent): void {
+   const memoryDir = path.join(baseDir, 'memory');
+   const systemDir = path.join(memoryDir, 'system');
+ 
+@@ -33,7 +34,7 @@ export function ensureMemoryScaffold(baseDir = '/workspace/agent'): void {
+ 
+ function copyTemplateIfMissing(template: string, dest: string): void {
+   try {
+-    fs.copyFileSync(path.join(TEMPLATES_DIR, template), dest, fs.constants.COPYFILE_EXCL);
++    fs.writeFileSync(dest, fs.readFileSync(path.join(TEMPLATES_DIR, template),'utf8').replaceAll('/workspace/agent', runtimeLayout().agent), {flag:'wx'});
+   } catch (err) {
+     if (typeof err !== 'object' || err === null || !('code' in err) || err.code !== 'EEXIST') throw err;
+   }
+diff --git a/container/agent-runner/src/memory/scaffold.wiring.test.ts b/container/agent-runner/src/memory/scaffold.wiring.test.ts
+index 359cb94..a7ff632 100644
+--- a/container/agent-runner/src/memory/scaffold.wiring.test.ts
++++ b/container/agent-runner/src/memory/scaffold.wiring.test.ts
+@@ -9,8 +9,8 @@ import path from 'path';
+ describe('memory scaffold boot wiring', () => {
+   const indexSrc = fs.readFileSync(path.join(import.meta.dir, '..', 'index.ts'), 'utf-8');
+ 
+-  it('scaffolds memory unconditionally in main()', () => {
+-    expect(indexSrc).toMatch(/\n\s*ensureMemoryScaffold\(\);/);
++  it('scaffolds normal agents and bypasses memory only for utility sessions', () => {
++    expect(indexSrc).toMatch(/if \(!config\.workspaceUtility\) ensureMemoryScaffold\(\);/);
+     expect(indexSrc).not.toContain('usesMemoryScaffold');
+   });
+ 
+diff --git a/container/agent-runner/src/memory/session-hook.ts b/container/agent-runner/src/memory/session-hook.ts
+index 0860df0..dab99e6 100644
+--- a/container/agent-runner/src/memory/session-hook.ts
++++ b/container/agent-runner/src/memory/session-hook.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from '../runtime-layout.js';
+ import { renderMemorySection } from './context.js';
+ 
+ const MEMORY_CONTEXT_SOURCES = ['startup', 'clear', 'compact'] as const;
+@@ -12,12 +13,16 @@ export interface MemorySessionHookRegistration {
+ }
+ 
+ export const MEMORY_SESSION_HOOK: MemorySessionHookRegistration = {
+-  command: 'bun /app/src/memory/hook.ts',
++  command: runtimeLayout().kind === 'container' ? 'bun /app/src/memory/hook.ts' : `${shellQuote(runtimeLayout().executables.bun)} run --no-env-file ${shellQuote(runtimeLayout().source + '/memory/hook.ts')}`,
+   legacyCommands: ['bun /app/src/memory-hook.ts'],
+   sources: MEMORY_CONTEXT_SOURCES,
+ };
+ 
+ /** Return memory only when a provider is establishing a new context window. */
+ export function memoryContextForSessionStart(source: MemorySessionStartSource, baseDir?: string): string | undefined {
++  // Native Claude refreshes memory in UserPromptSubmit; compaction still needs its own hook.
++  if (runtimeLayout().kind === 'native' && process.env.NANOCLAW_CLAUDE_TURN_MEMORY === '1' && source !== 'compact') return undefined;
+   return source === 'resume' ? undefined : renderMemorySection(baseDir);
+ }
++
++function shellQuote(value:string):string { return "'"+value.replace(/'/g,"'\\''")+"'"; }
+diff --git a/container/agent-runner/src/poll-loop.ts b/container/agent-runner/src/poll-loop.ts
+index e4d7982..2c1662b 100644
+--- a/container/agent-runner/src/poll-loop.ts
++++ b/container/agent-runner/src/poll-loop.ts
+@@ -1,3 +1,5 @@
++import { randomUUID } from 'node:crypto';
++import { renderWorkspaceContext, emitWorkspaceEvent, acknowledgeWorkspaceReconfigure, holdWorkspaceReconfigure } from './workspace-context.js';
+ import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
+ import {
+   getPendingMessages,
+@@ -125,6 +127,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+   let pollCount = 0;
+   let isFirstPoll = true;
+   while (true) {
++    if (config.signal?.aborted) return;
++    await holdWorkspaceReconfigure(config.signal);
+     if (config.signal?.aborted) return;
+     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
+     const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+@@ -240,7 +244,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
+ 
+     const query = config.provider.query({
+-      prompt,
++      prompt: prompt + renderWorkspaceContext(),
+       continuation,
+       cwd: config.cwd,
+       systemContext: config.systemContext,
+@@ -403,6 +407,9 @@ export async function processQuery(
+   // this?" truth lives in the outbound DB the door already writes to — no
+   // in-process delivery ledger. Reset alongside midTurnSent at each result.
+   let turnStartSeq = maxOutboundSeq();
++  let notificationId: string = randomUUID();
++  let notificationRanges: SeqWindow[] = [];
++  let retryScheduled = false;
+   // Cross-segment assembly buffer: the unresolved TAIL of the previous text
+   // event — an unclosed <message …> block (or a bare open-tag prefix like
+   // "<mess" literally split mid-token), or an unclosed <internal span. Frame-
+@@ -426,6 +433,8 @@ export async function processQuery(
+   // archivePrompts. An empty initial prompt (a pre-warmed query) starts idle.
+   let answering = initialPrompt !== '';
+   type QueuedTurn = {
++    notificationId?: string;
++    notificationRanges?: SeqWindow[];
+     routing: RoutingContext;
+     unwrappedNudged: boolean;
+     taskBlockNudged: boolean;
+@@ -438,17 +447,21 @@ export async function processQuery(
+   let nudgedWindow: SeqWindow | undefined;
+   const adoptTurn = (next: QueuedTurn): void => {
+     Object.assign(routing, next.routing);
++    notificationId = next.notificationId ?? randomUUID();
++    notificationRanges = next.notificationRanges ?? [];
+     unwrappedNudged = next.unwrappedNudged;
+     taskBlockNudged = next.taskBlockNudged;
+     nudgedWindow = next.nudgedWindow;
+     publishReplyRoute(routing);
+     answering = true;
++    emitWorkspaceEvent('turn-start', { queryStartedAt: Date.now() });
+   };
+   // A retry is another provider input, behind any follow-ups already pushed.
+   // Preserve its original route, prompt and retry guards until it is answered.
+   const pushRetry = (prompt: string, retryOf?: SeqWindow): void => {
++    retryScheduled = true;
+     query.push(prompt);
+-    queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged, nudgedWindow: retryOf });
++    queuedTurns.push({ notificationId, notificationRanges: [...notificationRanges, {after:turnStartSeq,upto:maxOutboundSeq()}], routing: { ...routing }, unwrappedNudged, taskBlockNudged, nudgedWindow: retryOf });
+     archivePrompts.push(archivePrompts[0] ?? initialPrompt);
+   };
+ 
+@@ -502,6 +515,20 @@ export async function processQuery(
+         // follow-up is also pending; otherwise they stay pending for a future
+         // batch (mirrors the two-phase initial-batch selection in
+         // db/messages-in.ts).
++        const workspaceControl = getAgentMailbox().operations.workspaceContext?.()?.control;
++        if (workspaceControl) {
++          const command = JSON.parse(workspaceControl);
++          if (command.kind === 'cancel' && Date.parse(command.at) >= queryStartedAt) {
++            endedForCommand = true;
++            query.abort();
++            emitWorkspaceEvent('turn-cancelled', {});
++            return;
++          }
++        }
++        if (!answering && acknowledgeWorkspaceReconfigure()) {
++          query.end();
++          return;
++        }
+         const hasFollowUpTrigger = pending.some((m) => m.kind !== 'system' && m.trigger === 1);
+         const newMessages = pending.filter((m) => m.kind !== 'system' && (m.trigger === 1 || hasFollowUpTrigger));
+         if (newMessages.length === 0) return;
+@@ -538,9 +565,10 @@ export async function processQuery(
+         const keptIds = keep.map((m) => m.id);
+         const prompt = formatMessages(keep);
+         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+-        query.push(prompt);
++        query.push(prompt + renderWorkspaceContext());
+         archivePrompts.push(prompt);
+         const next: QueuedTurn = {
++          notificationId: randomUUID(),
+           routing: extractRouting(keep),
+           unwrappedNudged: false,
+           taskBlockNudged: false,
+@@ -580,8 +608,23 @@ export async function processQuery(
+     })();
+   }, ACTIVE_POLL_INTERVAL_MS);
+ 
++  const queryStartedAt = Date.now();
++  emitWorkspaceEvent('turn-start', { queryStartedAt });
+   try {
+     for await (const event of query.events) {
++      const control = getAgentMailbox().operations.workspaceContext?.()?.control;
++      if (control) {
++        const command = JSON.parse(control);
++        if (command.kind === 'cancel' && Date.parse(command.at) >= queryStartedAt) {
++          endedForCommand = true;
++          query.abort();
++          emitWorkspaceEvent('turn-cancelled', {});
++          break;
++        }
++      }
++      if (event.type === 'display') emitWorkspaceEvent(event.kind, { id: event.id, ...event.data });
++      if (event.type === 'result') emitWorkspaceEvent('turn-result', { isError: event.isError ?? false });
++      if (event.type === 'error') emitWorkspaceEvent('turn-error', { message: event.message });
+       handleEvent(event, routing);
+       touchHeartbeat();
+ 
+@@ -609,6 +652,7 @@ export async function processQuery(
+           midTurnTail = scan.tail;
+         }
+       } else if (event.type === 'result') {
++        retryScheduled = false;
+         // A result — with or without text — means the turn is done. Mark
+         // the initial batch completed now so the host sweep doesn't see
+         // stale 'processing' claims while the query stays open for
+@@ -703,6 +747,7 @@ export async function processQuery(
+         // genuinely re-sending the same body still delivers. The assembly
+         // buffer dies with the turn: a fragment that never closed is not
+         // carried into the next turn — the wrap-nudge owns that case.
++        if (!retryScheduled && !endedForCommand && !signal?.aborted) emitWorkspaceEvent('turn-finished', {id:notificationId, failed:event.isError===true, ranges:[...notificationRanges,{after:turnStartSeq,upto:maxOutboundSeq()}]});
+         midTurnSent = 0;
+         midTurnReplied = 0;
+         turnStartSeq = maxOutboundSeq();
+@@ -713,6 +758,7 @@ export async function processQuery(
+         else answering = false;
+       }
+     }
++    if (answering && !endedForCommand && !signal?.aborted) emitWorkspaceEvent('turn-finished', {id:notificationId,failed:true,ranges:[...notificationRanges,{after:turnStartSeq,upto:maxOutboundSeq()}]});
+   } catch (err) {
+     // Freeze the queue before awaiting notices. Follow-ups have already been
+     // acknowledged, so an abandoned queued turn cannot rely on redelivery.
+@@ -755,6 +801,10 @@ export async function processQuery(
+         }
+       }
+     }
++    if (!cancelled) {
++      if (answering) emitWorkspaceEvent('turn-finished', {id:notificationId,failed:true,ranges:[...notificationRanges,{after:turnStartSeq,upto:maxOutboundSeq()}]});
++      for (const turn of queuedTurns) if (turn.notificationId) emitWorkspaceEvent('turn-finished', {id:turn.notificationId,failed:true,ranges:turn.notificationRanges ?? []});
++    }
+     // Continuation recovery receives the original error; diagnostics remain
+     // in the exchange archive and runner log, never in the channel notice.
+     throw err;
+diff --git a/container/agent-runner/src/provider-contracts/exchange-archive.ts b/container/agent-runner/src/provider-contracts/exchange-archive.ts
+index 3bbb93c..7cc4987 100644
+--- a/container/agent-runner/src/provider-contracts/exchange-archive.ts
++++ b/container/agent-runner/src/provider-contracts/exchange-archive.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from '../runtime-layout.js';
+ import fs from 'fs';
+ import path from 'path';
+ 
+@@ -14,7 +15,7 @@ import { TIMEZONE, formatLocalStamp } from '../timezone.js';
+  * date is the thread's creation day and stays stable across later appends.
+  */
+ 
+-const DEFAULT_CONVERSATIONS_DIR = '/workspace/agent/conversations';
++const DEFAULT_CONVERSATIONS_DIR = `${runtimeLayout().agent}/conversations`;
+ 
+ export interface ProviderExchangeArchiveOptions {
+   provider: string;
+diff --git a/container/agent-runner/src/providers/claude-history.ts b/container/agent-runner/src/providers/claude-history.ts
+index d950a36..38a9562 100644
+--- a/container/agent-runner/src/providers/claude-history.ts
++++ b/container/agent-runner/src/providers/claude-history.ts
+@@ -1,3 +1,4 @@
++import { runtimeLayout } from '../runtime-layout.js';
+ /**
+  * Claude-owned transcript history: the pre-compact archive, continuation
+  * rotation, and the newest-trace lookup. All of it reads the Claude Agent
+@@ -105,7 +106,7 @@ export function archiveClaudeTranscript(input: ClaudeArchiveInput, fx: ClaudeHis
+     );
+     if (!plan) return false;
+ 
+-    const conversationsDir = process.env.NANOCLAW_CONVERSATIONS_DIR || '/workspace/agent/conversations';
++    const conversationsDir = process.env.NANOCLAW_CONVERSATIONS_DIR || `${runtimeLayout().agent}/conversations`;
+     const target = resolveContainedPath(conversationsDir, plan.relativePath, 'Archive planner returned unsafe path');
+     fs.mkdirSync(conversationsDir, { recursive: true });
+     writeArchivePlan(target, plan);
+diff --git a/container/agent-runner/src/providers/claude.system-prompt.test.ts b/container/agent-runner/src/providers/claude.system-prompt.test.ts
+index 5686478..37657c2 100644
+--- a/container/agent-runner/src/providers/claude.system-prompt.test.ts
++++ b/container/agent-runner/src/providers/claude.system-prompt.test.ts
+@@ -59,3 +59,29 @@ describe('system prompt append', () => {
+     });
+   });
+ });
++
++it('runs workspace utilities with plain instructions and no project settings, tools, MCP, or memory hooks', async () => {
++  const provider = createProvider('claude', {});
++  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
++  const q = provider.query({
++    utility: true,
++    prompt: 'Summarize quoted evidence',
++    cwd: tmp,
++    systemContext: { instructions: 'Return notes only.' },
++  });
++  for await (const _ of q.events) {
++    /* drain */
++  }
++  expect(lastOptions).toMatchObject({
++    systemPrompt: 'Return notes only.',
++    tools: [],
++    allowedTools: [],
++    settingSources: [],
++    mcpServers: {},
++    hooks: {},
++  });
++  const controller = lastOptions?.abortController as AbortController;
++  expect(controller.signal.aborted).toBe(false);
++  q.abort();
++  expect(controller.signal.aborted).toBe(true);
++});
+diff --git a/container/agent-runner/src/providers/claude.ts b/container/agent-runner/src/providers/claude.ts
+index 1af8142..46c33d8 100644
+--- a/container/agent-runner/src/providers/claude.ts
++++ b/container/agent-runner/src/providers/claude.ts
+@@ -1,3 +1,7 @@
++import fs from 'node:fs';
++import { renderMemorySection } from '../memory/context.js';
++import { nativeInstructionContext } from '../instruction-context.js';
++import { runtimeLayout, runtimeToolAllowed, canonicalToolName } from '../runtime-layout.js';
+ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+ 
+ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
+@@ -123,6 +127,7 @@ class MessageStream {
+ const preToolUseHook: HookCallback = async (input) => {
+   const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
+   const toolName = i.tool_name ?? '';
++  if (!runtimeToolAllowed(canonicalToolName(toolName))) return {hookSpecificOutput:{hookEventName:'PreToolUse',permissionDecision:'deny',permissionDecisionReason:'Denied by NanoClaw execution policy'}};
+   if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
+     return {
+       decision: 'block',
+@@ -262,52 +267,63 @@ export class ClaudeProvider implements AgentProvider {
+ 
+   query(input: QueryInput): AgentQuery {
+     if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
++    const abortController = new AbortController();
+     const stream = new MessageStream();
+     stream.push(input.prompt);
+ 
+-    const instructions = input.systemContext?.instructions;
++    const instructions = [input.utility ? '' : (runtimeLayout().kind === 'native' ? fs.readFileSync(runtimeLayout().instructions!, 'utf8') : ''), input.systemContext?.instructions].filter(Boolean).join('\n\n') || undefined;
+ 
+     const sdkResult = sdkQuery({
+       prompt: stream,
+       options: {
++        abortController,
+         cwd: input.cwd,
+         additionalDirectories: this.additionalDirectories,
+         resume: input.continuation,
+-        pathToClaudeCodeExecutable: '/pnpm/claude',
++        pathToClaudeCodeExecutable: runtimeLayout().executables.claude,
+         // The append (agent name + destinations) is rebuilt at every container
+         // start. Left to the SDK default, Claude Code records the prompt on a
+         // session's first request and resends that record on every resume, so
+         // a resumed agent would keep its old name and destination list until
+         // compaction. snapshot: false renders it fresh each time.
+-        systemPrompt: instructions
+-          ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions, snapshot: false }
+-          : undefined,
+-        allowedTools: [...this.mcp.allowedTools],
++        systemPrompt: input.utility
++          ? instructions
++          : instructions
++            ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions, snapshot: false }
++            : undefined,
++        ...(input.utility ? { tools: [] as string[] } : {}),
++        allowedTools: input.utility ? [] : [...this.mcp.allowedTools],
+         disallowedTools: [...this.executionPolicy.disallowedTools],
+         // The SDK emits `assistant` only per completed content block, so a long
+         // block is silent and the host sweep kills the container mid-generation.
+         // Streaming deltas are the liveness signal for that window; translateEvents
+         // turns them into throttled `activity` and nothing else.
+         includePartialMessages: true,
+-        env: this.env,
++        env: { ...this.env, ...(runtimeLayout().kind === 'native' ? { NANOCLAW_CLAUDE_TURN_MEMORY: '1' } : {}) },
+         model: this.inference.model,
+         // eslint-disable-next-line @typescript-eslint/no-explicit-any
+         effort: this.inference.effort as any,
+         permissionMode: this.executionPolicy.permissionMode,
+         allowDangerouslySkipPermissions: this.executionPolicy.allowDangerouslySkipPermissions,
+-        settingSources: ['project', 'user', 'local'],
++        settingSources: input.utility ? [] : runtimeLayout().kind === 'native' ? ['user'] : ['project', 'user', 'local'],
+         // Flag-level settings: `fastMode` only when the install turns it on,
+         // then the execution policy's fixed keys, spread last so per-group
+         // input can never override them. Both are Settings members rather
+         // than query options, which is why they ride `settings`.
+         settings: { ...this.inference.settings, ...this.executionPolicy.settings },
+-        mcpServers: this.mcp.mcpServers,
+-        hooks: {
+-          PreToolUse: [{ hooks: [preToolUseHook] }],
+-          PostToolUse: [{ hooks: [postToolUseHook] }],
+-          PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+-          PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+-        },
++        mcpServers: input.utility ? {} : this.mcp.mcpServers,
++        hooks: input.utility
++          ? {}
++          : {
++              ...(runtimeLayout().kind === 'native' ? { UserPromptSubmit: [{ hooks: [async () => ({
++                hookSpecificOutput: { hookEventName: 'UserPromptSubmit' as const,
++                  additionalContext: [nativeInstructionContext(input.cwd, 'claude', false), renderMemorySection()].filter(Boolean).join('\n\n') },
++              })] }] } : {}),
++              PreToolUse: [{ hooks: [preToolUseHook] }],
++              PostToolUse: [{ hooks: [postToolUseHook] }],
++              PostToolUseFailure: [{ hooks: [postToolUseHook] }],
++              PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
++            },
+       },
+     });
+ 
+@@ -323,6 +339,30 @@ export class ClaudeProvider implements AgentProvider {
+         // is working. Deltas arrive per token and carry no content for us, so
+         // they count at most once per second, and not as messages.
+         if (message.type === 'stream_event') {
++          const partial = message as unknown as {
++            event?: {
++              type?: string;
++              index?: number;
++              delta?: { type?: string; text?: string };
++              content_block?: { type?: string; id?: string; name?: string };
++            };
++            uuid?: string;
++          };
++          const part = partial.event;
++          if (part?.delta?.type === 'text_delta' && part.delta.text)
++            yield {
++              type: 'display',
++              kind: 'text-delta',
++              id: `claude-${part.index ?? 0}`,
++              data: { delta: part.delta.text },
++            };
++          if (part?.content_block?.type === 'tool_use')
++            yield {
++              type: 'display',
++              kind: 'tool',
++              id: part.content_block.id ?? `tool-${part.index}`,
++              data: { name: part.content_block.name, status: 'running' },
++            };
+           const now = Date.now();
+           if (now - lastStreamActivityAt < STREAM_ACTIVITY_INTERVAL_MS) continue;
+           lastStreamActivityAt = now;
+@@ -351,15 +391,47 @@ export class ClaudeProvider implements AgentProvider {
+           // result reports. Blocks split across ASSISTANT MESSAGES (a tool
+           // call between them) remain unparseable mid-turn by design; the
+           // poll-loop's midTurnSent===0 fallback and wrap-nudge cover that.
+-          const content = (message as { message?: { content?: Array<{ type?: string; text?: string }> } }).message
+-            ?.content;
++          const content = (
++            message as {
++              message?: {
++                content?: Array<{ type?: string; text?: string; id?: string; name?: string; input?: unknown }>;
++              };
++            }
++          ).message?.content;
+           if (Array.isArray(content)) {
++            for (const block of content)
++              if (block.type === 'tool_use')
++                yield {
++                  type: 'display',
++                  kind: 'tool',
++                  id: block.id ?? 'tool',
++                  data: { name: block.name, input: block.input, status: 'running' },
++                };
+             const text = content
+               .filter((block) => block.type === 'text' && block.text)
+               .map((block) => block.text)
+               .join('');
+             if (text) yield { type: 'text', text };
+           }
++        } else if (message.type === 'user') {
++          const content = (
++            message as unknown as {
++              message?: {
++                content?: Array<{ type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }>;
++              };
++            }
++          ).message?.content;
++          for (const block of Array.isArray(content) ? content : [])
++            if (block.type === 'tool_result')
++              yield {
++                type: 'display',
++                kind: 'tool',
++                id: block.tool_use_id ?? 'tool',
++                data: {
++                  status: block.is_error ? 'error' : 'completed',
++                  output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
++                },
++              };
+         } else if (message.type === 'result') {
+           // `result` text exists only on subtype:"success"; error subtypes
+           // (e.g. a non-retryable 403 billing_error) carry their message in
+@@ -433,6 +505,7 @@ export class ClaudeProvider implements AgentProvider {
+       events: translateEvents(),
+       abort: () => {
+         aborted = true;
++        abortController.abort();
+         stream.end();
+       },
+     };
+diff --git a/container/agent-runner/src/providers/types.ts b/container/agent-runner/src/providers/types.ts
+index 9ae9d8e..3a61a92 100644
+--- a/container/agent-runner/src/providers/types.ts
++++ b/container/agent-runner/src/providers/types.ts
+@@ -72,6 +72,7 @@ export interface ProviderExchange {
+  * providers; individual providers may ignore any they don't need.
+  */
+ export interface ProviderOptions {
++  utilityMode?: boolean;
+   assistantName?: string;
+   mcpServers?: Record<string, McpServerConfig>;
+   env?: Record<string, string | undefined>;
+@@ -95,6 +96,7 @@ export interface ProviderOptions {
+ }
+ 
+ export interface QueryInput {
++  utility?: boolean;
+   /** Initial prompt (already formatted by agent-runner). */
+   prompt: string;
+ 
+@@ -154,6 +156,7 @@ export interface AgentQuery {
+ }
+ 
+ export type ProviderEvent =
++  | { type: 'display'; kind: 'text-delta' | 'tool' | 'usage'; id: string; data: Record<string, unknown> }
+   | { type: 'init'; continuation: string }
+   /**
+    * A completed turn. `isError` marks a failed turn and prevents retries.
+diff --git a/container/cli-tools.json b/container/cli-tools.json
+index 00cf423..dea7f3e 100644
+--- a/container/cli-tools.json
++++ b/container/cli-tools.json
+@@ -8,5 +8,10 @@
+     "name": "@anthropic-ai/claude-code",
+     "version": "2.1.296",
+     "onlyBuilt": true
++  },
++  {
++    "name": "opencode-ai",
++    "version": "1.19.4",
++    "onlyBuilt": true
+   }
+ ]
+diff --git a/package.json b/package.json
+index cdb3c32..5d70f0f 100644
+--- a/package.json
++++ b/package.json
+@@ -35,7 +35,8 @@
+     "lint": "eslint src/",
+     "lint:fix": "eslint src/ --fix",
+     "test": "vitest run",
+-    "test:watch": "vitest"
++    "test:watch": "vitest",
++    "execution-policy:check": "cmp src/execution/policy.ts container/agent-runner/src/execution-policy.generated.ts"
+   },
+   "dependencies": {
+     "@clack/core": "^1.2.0",
+@@ -44,7 +45,8 @@
+     "chat": "4.41.1",
+     "cron-parser": "5.5.0",
+     "kleur": "^4.1.5",
+-    "yaml": "^2.9.0"
++    "yaml": "^2.9.0",
++    "@anthropic-ai/sandbox-runtime": "0.0.81"
+   },
+   "devDependencies": {
+     "@eslint/js": "^9.35.0",
+@@ -63,5 +65,9 @@
+   },
+   "engines": {
+     "node": ">=22"
++  },
++  "optionalDependencies": {
++    "opencode-darwin-arm64": "1.19.4",
++    "opencode-darwin-x64": "1.19.4"
+   }
+ }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 383b7ed..4546ec6 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -4,10 +4,22 @@ settings:
+   autoInstallPeers: true
+   excludeLinksFromLockfile: false
+ 
++overrides:
++  '@anthropic-ai/sandbox-runtime>node-forge': '-'
++  '@anthropic-ai/sandbox-runtime>zod': 4.6.7
++
++patchedDependencies:
++  '@anthropic-ai/sandbox-runtime@0.0.81':
++    hash: 275f3957b109213ccad84539b1a9fd25d91a4feb12566951173f0db325b5eb5d
++    path: patches/@anthropic-ai__sandbox-runtime@0.0.81.patch
++
+ importers:
+ 
+   .:
+     dependencies:
++      '@anthropic-ai/sandbox-runtime':
++        specifier: 0.0.81
++        version: 0.0.81(patch_hash=275f3957b109213ccad84539b1a9fd25d91a4feb12566951173f0db325b5eb5d)
+       '@clack/core':
+         specifier: ^1.2.0
+         version: 1.2.0
+@@ -19,7 +31,7 @@ importers:
+         version: 13.0.3
+       chat:
+         specifier: 4.41.1
+-        version: 4.41.1
++        version: 4.41.1(zod@4.6.7)
+       cron-parser:
+         specifier: 5.5.0
+         version: 5.5.0
+@@ -69,9 +81,21 @@ importers:
+       vitest:
+         specifier: ^4.1.11
+         version: 4.1.11(@types/node@22.19.17)(vite@8.3.4(@types/node@22.19.17)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.0))
++    optionalDependencies:
++      opencode-darwin-arm64:
++        specifier: 1.19.4
++        version: 1.19.4
++      opencode-darwin-x64:
++        specifier: 1.19.4
++        version: 1.19.4
+ 
+ packages:
+ 
++  '@anthropic-ai/sandbox-runtime@0.0.81':
++    resolution: {integrity: sha512-bjHDu87gjIR7+Oxy9jPiK3v8CvSELCzfpXa3fjqfSKdvlZET2iF51xcXILWPayTpowB3xtZeQVf2JR916nVW/w==}
++    engines: {node: '>=22.12.0'}
++    hasBin: true
++
+   '@clack/core@1.2.0':
+     resolution: {integrity: sha512-qfxof/3T3t9DPU/Rj3OmcFyZInceqj/NVtO9rwIuJqCUgh32gwPjpFQQp/ben07qKlhpwq7GzfWpST4qdJ5Drg==}
+ 
+@@ -298,6 +322,9 @@ packages:
+   '@oxc-project/types@0.153.0':
+     resolution: {integrity: sha512-jSNrRIyvPVLL5E1z/tS5zLAprosGz/FuI1PWwEOz59j3E4TTTzSpqKb/RDGqJhhW0QHYISGXxq582wGx6T11Tw==}
+ 
++  '@pondwader/socks5-server@1.0.10':
++    resolution: {integrity: sha512-bQY06wzzR8D2+vVCUoBsr5QS2U6UgPUQRmErNwtsuI6vLcyRKkafjkr3KxbtGFf9aBBIV2mcvlsKD1UYaIV+sg==}
++
+   '@rolldown/binding-android-arm-eabi@1.2.13':
+     resolution: {integrity: sha512-Vu/NICrgdRvUOeaJZIyB2FP63s6fO/4ud5l8dXmxDx9yDyn+mN0y+gsvsVviSli+T361Aqo0h46EuMoobrwawA==}
+     engines: {node: ^20.19.0 || >=22.12.0}
+@@ -609,6 +636,10 @@ packages:
+   color-name@1.1.4:
+     resolution: {integrity: sha512-dOy+3AuW3a2wNbZHIuMZpTcgjGuLU/uBL/ubcZF9OXbDo8ff4O8yVp5Bf0efS8uEoYo5q4Fx7dY9OgQGXgAsQA==}
+ 
++  commander@12.1.0:
++    resolution: {integrity: sha512-Vw8qHK3bZM9y/P10u3Vib8o/DdkvA2OtPtZvD871QKjy74Wj1WSKFILMPRPSdUSx5RFK1arlJzEtA4PkFgnbuA==}
++    engines: {node: '>=18'}
++
+   concat-map@0.0.1:
+     resolution: {integrity: sha512-/Srv4dswyQNBfohGpz9o6Yb3Gz3SrUDqBH5rTuhGR7ahtlbYKnVxw2bCFMRljaA7EXHaXZ8wsHdodFvbkhKmqg==}
+ 
+@@ -1087,6 +1118,16 @@ packages:
+     resolution: {integrity: sha512-XrsrhT5sybtKI6wakr2SPOlGZWWYbUXZ7a0jT8/QOeAPau+1X/bSegNe5YR75oJmEZQbKningirmGOEJCIk61Q==}
+     engines: {node: '>=12.20.0'}
+ 
++  opencode-darwin-arm64@1.19.4:
++    resolution: {integrity: sha512-31sy6eA88QO2vXra395rPxe995a2G0IKKAqm7B/ZESwIGVK9auMdYfKd7mf5icI72oFMLUwRJGQ1f4B/ykbDJg==}
++    cpu: [arm64]
++    os: [darwin]
++
++  opencode-darwin-x64@1.19.4:
++    resolution: {integrity: sha512-ILgql0oUVdZeWnWVGsv5by/gPeY9ytYS5KTCQSoxgo0H1TzbnNMSd+IAn9dHL1H4XSZBtgPTfdMK9r1sWPbYbA==}
++    cpu: [x64]
++    os: [darwin]
++
+   optionator@0.9.4:
+     resolution: {integrity: sha512-6IpQ7mKUxRcZNLIObR0hz7lxsapSSIYNZJwXPGeF0mTVqGKFIXj1DQcMoT22S3ROcLyY/rz0PWaWZ9ayWmad9g==}
+     engines: {node: '>= 0.8.0'}
+@@ -1375,11 +1416,20 @@ packages:
+     resolution: {integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==}
+     engines: {node: '>=10'}
+ 
++  zod@4.6.7:
++    resolution: {integrity: sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==}
++
+   zwitch@2.0.4:
+     resolution: {integrity: sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A==}
+ 
+ snapshots:
+ 
++  '@anthropic-ai/sandbox-runtime@0.0.81(patch_hash=275f3957b109213ccad84539b1a9fd25d91a4feb12566951173f0db325b5eb5d)':
++    dependencies:
++      '@pondwader/socks5-server': 1.0.10
++      commander: 12.1.0
++      zod: 4.6.7
++
+   '@clack/core@1.2.0':
+     dependencies:
+       fast-wrap-ansi: 0.1.6
+@@ -1536,6 +1586,8 @@ snapshots:
+ 
+   '@oxc-project/types@0.153.0': {}
+ 
++  '@pondwader/socks5-server@1.0.10': {}
++
+   '@rolldown/binding-android-arm-eabi@1.2.13':
+     optional: true
+ 
+@@ -1805,7 +1857,7 @@ snapshots:
+ 
+   character-entities@2.0.2: {}
+ 
+-  chat@4.41.1:
++  chat@4.41.1(zod@4.6.7):
+     dependencies:
+       '@workflow/serde': 4.1.0-beta.2
+       mdast-util-to-string: 4.0.0
+@@ -1814,6 +1866,8 @@ snapshots:
+       remark-stringify: 11.0.0
+       remend: 1.3.0
+       unified: 11.0.5
++    optionalDependencies:
++      zod: 4.6.7
+     transitivePeerDependencies:
+       - supports-color
+ 
+@@ -1823,6 +1877,8 @@ snapshots:
+ 
+   color-name@1.1.4: {}
+ 
++  commander@12.1.0: {}
++
+   concat-map@0.0.1: {}
+ 
+   convert-source-map@2.0.0: {}
+@@ -2439,6 +2495,12 @@ snapshots:
+ 
+   obug@2.2.1: {}
+ 
++  opencode-darwin-arm64@1.19.4:
++    optional: true
++
++  opencode-darwin-x64@1.19.4:
++    optional: true
++
+   optionator@0.9.4:
+     dependencies:
+       deep-is: 0.1.4
+@@ -2698,4 +2760,6 @@ snapshots:
+ 
+   yocto-queue@0.1.0: {}
+ 
++  zod@4.6.7: {}
++
+   zwitch@2.0.4: {}
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index bf5a7e4..59e3a14 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -10,3 +10,9 @@ onlyBuiltDependencies:
+ # a no-op. New package versions must exist on the registry this many minutes
+ # (4320 = 3 days) before pnpm will resolve them.
+ minimumReleaseAge: 4320
++
++patchedDependencies:
++  '@anthropic-ai/sandbox-runtime@0.0.81': patches/@anthropic-ai__sandbox-runtime@0.0.81.patch
++overrides:
++  '@anthropic-ai/sandbox-runtime>node-forge': '-'
++  '@anthropic-ai/sandbox-runtime>zod': '4.6.7'
+diff --git a/src/cli/dispatch.ts b/src/cli/dispatch.ts
+index b59f480..0fcd5ef 100644
+--- a/src/cli/dispatch.ts
++++ b/src/cli/dispatch.ts
+@@ -82,6 +82,18 @@ export async function dispatch(
+     return err(req.id, 'unknown-command', unknownCommandMessage(req.command));
+   }
+ 
++  if (ctx.caller === 'agent' && !cmd.hostOnly) {
++    const session = await getSession(ctx.sessionId);
++    if (session?.runtime_driver === 'native-macos') {
++      const { ExecutionStore } = await import('../execution/store.js');
++      const { getDb } = await import('../db/connection.js');
++      const { toolAllowed } = await import('../execution/policy.js');
++      const policy = (await new ExecutionStore(getDb()).effective(ctx.agentGroupId, ctx.sessionId)).policy;
++      if (!toolAllowed(policy, 'mcp:nanoclaw:ncl') || !toolAllowed(policy, `ncl:${req.command}`))
++        return err(req.id, 'forbidden', 'Tool denied by native execution policy');
++    }
++  }
++
+   // Group-scope mechanics for agent callers (visibility, not policy — the
+   // allow/hold/deny decisions live in the guard decision, cli/guard.ts).
+   // Read once: the auto-fill and the post-handler filter must agree.
+diff --git a/src/cli/resources/groups-restart-rebuild.test.ts b/src/cli/resources/groups-restart-rebuild.test.ts
+index 17178c9..e01649e 100644
+--- a/src/cli/resources/groups-restart-rebuild.test.ts
++++ b/src/cli/resources/groups-restart-rebuild.test.ts
+@@ -1,3 +1,5 @@
++import {initTestDb,closeDb} from '../../db/connection.js';
++import {runMigrations} from '../../db/migrations/index.js';
+ /**
+  * `ncl groups restart --rebuild` × driver capabilities.
+  *
+@@ -53,7 +55,8 @@ function noImageBuildDriver(): SessionDriver {
+   };
+ }
+ 
+-beforeEach(() => {
++beforeEach(async () => {
++  await runMigrations(await initTestDb());
+   vi.clearAllMocks();
+ });
+ 
+@@ -109,3 +112,5 @@ describe('groups restart --rebuild gates on the imageBuild capability', () => {
+     }
+   });
+ });
++
++afterEach(async()=>{await closeDb();});
+diff --git a/src/cli/resources/groups.ts b/src/cli/resources/groups.ts
+index 9879168..201eddb 100644
+--- a/src/cli/resources/groups.ts
++++ b/src/cli/resources/groups.ts
+@@ -251,6 +251,7 @@ registerResource({
+         const exists = await db.get('SELECT 1 FROM agent_groups WHERE id = ? LIMIT 1', id);
+         if (!exists) throw new Error(`group not found: ${id}`);
+ 
++        await (await import('../../execution/browser.js')).stopHostBrowser(id);
+         const hasAgentDestinations = await hasTable(db, 'agent_destinations');
+         const hasPendingApprovals = await hasTable(db, 'pending_approvals');
+         let destinationOwners: string[] = [];
+@@ -342,6 +343,8 @@ registerResource({
+           return counts;
+         });
+ 
++        // Fence browser starts that raced the deletion: future requests now see no group.
++        await (await import('../../execution/browser.js')).stopHostBrowser(id);
+         // Like `destinations remove`: drop the group from live session mailboxes now, not at next spawn.
+         for (const agentGroupId of destinationOwners) await projectDestinationsToSessions(agentGroupId);
+ 
+@@ -365,7 +368,9 @@ registerResource({
+           // on a nonexistent group id) and restart nothing: the operator asked
+           // for rebuild-then-restart, and restarting after silently skipping
+           // the rebuild would report success for a rebuild that never happened.
+-          if (!getSessionDriver().capabilities().imageBuild) {
++          const executionSession = ctx.caller === 'agent' ? await (await import('../../db/sessions.js')).getSession(ctx.sessionId) : undefined;
++          const executionConfig = await getContainerConfig(id);
++          if (!getSessionDriver(executionSession?.runtime_driver || executionConfig?.runtime_driver).capabilities().imageBuild) {
+             return {
+               restarted: 0,
+               rebuilt: false,
+diff --git a/src/cli/resources/index.ts b/src/cli/resources/index.ts
+index 8715a61..a29194d 100644
+--- a/src/cli/resources/index.ts
++++ b/src/cli/resources/index.ts
+@@ -16,3 +16,5 @@ import './approvals.js';
+ import './sessions.js';
+ import './tasks.js';
+ import './templates.js';
++
++import './execution.js';
+diff --git a/src/container-config.ts b/src/container-config.ts
+index 9bb116f..5d12665 100644
+--- a/src/container-config.ts
++++ b/src/container-config.ts
+@@ -9,6 +9,7 @@
+  *   - `configFromDb()` — builds a `ContainerConfig` from a DB row + agent group
+  */
+ import fs from 'fs';
++import { writeAtomic } from './atomic-file.js';
+ import path from 'path';
+ 
+ import { DEFAULT_MODEL, FAST_MODE, GROUPS_DIR, TIMEZONE } from './config.js';
+@@ -237,6 +238,8 @@ export interface AdditionalMountConfig {
+ 
+ /** Shape of the materialized `container.json` file read by the container runner. */
+ export interface ContainerConfig {
++  workspaceWorkingDirectory?: string;
++  workspaceUtility?: boolean;
+   mcpServers: Record<string, McpServerConfig>;
+   packages: { apt: string[]; npm: string[] };
+   imageTag?: string;
+@@ -418,7 +421,7 @@ export async function materializeContainerJson(agentGroupId: string): Promise<Co
+   const p = path.join(GROUPS_DIR, group.folder, 'container.json');
+   const dir = path.dirname(p);
+   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+-  fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
++  writeAtomic(p, JSON.stringify(config, null, 2) + '\n');
+ 
+   return config;
+ }
+diff --git a/src/container-runner.gateway-input.test.ts b/src/container-runner.gateway-input.test.ts
+index a39b030..da295fd 100644
+--- a/src/container-runner.gateway-input.test.ts
++++ b/src/container-runner.gateway-input.test.ts
+@@ -4,24 +4,27 @@
+  * agent can attach the right one. Adoption passes none.
+  */
+ import fs from 'fs';
++import path from 'node:path';
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ 
+ import type { SupervisedHandle } from './drivers/session-events.js';
+ 
+-const { prepare } = vi.hoisted(() => ({ prepare: vi.fn() }));
++const { prepare, selectDriver } = vi.hoisted(() => ({ prepare: vi.fn(), selectDriver: vi.fn() }));
+ vi.mock('./config.js', async () => {
+   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
+-  const root = `/tmp/nanoclaw-test-gateway-input-${process.pid}`;
++  const path = await import('node:path');
++  const root = path.resolve(`.cache/nanoclaw-test-gateway-input-${process.pid}`);
+   return { ...actual, DATA_DIR: `${root}/data`, GROUPS_DIR: `${root}/groups` };
+ });
+ vi.mock('./drivers/index.js', () => {
+   const driver = { kind: 'fake', listSessions: async () => [], prepare, capabilities: () => ({}) };
+-  return { getSessionDriver: () => driver, isSessionEventsDriver: () => false };
++  selectDriver.mockImplementation(() => driver);
++  return { getSessionDriver: selectDriver, isSessionEventsDriver: () => false };
+ });
+ 
+ import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+ import { ensureContainerConfig } from './db/container-configs.js';
+-import { initTestDb, closeDb, runMigrations, createAgentGroup, createSession } from './db/index.js';
++import { initTestDb, closeDb, runMigrations, createAgentGroup, createSession, getSession } from './db/index.js';
+ import { type GatewaySessionInput, resetGatewayProvider } from './gateway-providers/index.js';
+ import type { Session } from './types.js';
+ 
+@@ -60,6 +63,7 @@ function fakeHandle(): SupervisedHandle {
+ beforeEach(async () => {
+   ensure.mockClear();
+   prepare.mockReset();
++  selectDriver.mockClear();
+   prepare.mockResolvedValue(fakeHandle());
+   resetGatewayProvider({
+     kind: 'fixture',
+@@ -86,10 +90,35 @@ afterEach(async () => {
+   }
+   resetGatewayProvider();
+   await closeDb();
+-  fs.rmSync(`/tmp/nanoclaw-test-gateway-input-${process.pid}`, { recursive: true, force: true });
++  fs.rmSync(path.resolve(`.cache/nanoclaw-test-gateway-input-${process.pid}`), { recursive: true, force: true });
+ });
+ 
+ describe('gateway session input on spawn', () => {
++  it('retains the activity lock when runtime startup fails', async () => {
++    prepare.mockRejectedValueOnce(new Error('fixture startup failure'));
++    const saved = {
++      ...session(null),
++      runtime_driver: 'docker',
++      container_status: 'stopped' as const,
++      last_active: null,
++    };
++    await createSession(saved);
++    expect(await wakeContainer(saved)).toBe(false);
++    expect((await getSession(saved.id))?.last_active).not.toBeNull();
++  });
++  it('reloads the saved backend before spawning from a stale caller snapshot', async () => {
++    const saved = {
++      ...session(null),
++      runtime_driver: 'docker',
++      container_status: 'stopped' as const,
++      last_active: null,
++    };
++    await createSession(saved);
++    expect(await wakeContainer({ ...saved, runtime_driver: 'native-macos' })).toBe(true);
++    expect(selectDriver).toHaveBeenCalledWith('docker');
++    expect(selectDriver).not.toHaveBeenCalledWith('native-macos');
++    expect(prepare).toHaveBeenCalled();
++  });
+   it('names the provider a group with no configured provider runs (claude)', async () => {
+     await createSession(session(null));
+     expect(await wakeContainer(session(null))).toBe(true);
+diff --git a/src/container-runner.ts b/src/container-runner.ts
+index 71c5038..a8519b0 100644
+--- a/src/container-runner.ts
++++ b/src/container-runner.ts
+@@ -1,3 +1,5 @@
++import { selectedSkillNames } from './runtime-skills.js';
++import { installationRuntime } from './execution/runtime.js';
+ /**
+  * Container Runner v2
+  *
+@@ -42,15 +44,15 @@ import {
+ } from './db/coordination.js';
+ import { getHostInstanceId } from './host-instance.js';
+ import { getDb, hasTable } from './db/connection.js';
+-import { getSession } from './db/sessions.js';
++import { getSession, recordSessionActivity } from './db/sessions.js';
+ import { getSessionDriver, isSessionEventsDriver } from './drivers/index.js';
++import { composeNativeSession, nativeAgentHome, nativePaths } from './execution/compose.js';
+ import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-events.js';
+ import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/types.js';
+ import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './drivers/types.js';
+ import {
+   gatewayRuntimeIdentity,
+   getGatewayProvider,
+-  selectGatewayAgentSkills,
+   type GatewayContribution,
+   type GatewaySessionInput,
+   type GatewaySessionLease,
+@@ -60,6 +62,7 @@ import { initGroupFilesystem } from './group-init.js';
+ import { getAgentMailbox } from './mailbox/index.js';
+ import { stopTypingRefresh } from './modules/typing/index.js';
+ import { log } from './log.js';
++import { sessionWorkspaceConfiguration } from './session-workspace.js';
+ import { validateAdditionalMounts } from './modules/mount-security/index.js';
+ // Provider contracts use a separate barrel so update-skills identity detection
+ // remains tied to src/providers/index.ts.
+@@ -207,6 +210,27 @@ async function releaseClaimQuietly(sessionId: string, incarnation: number): Prom
+  */
+ const wakePromises = new Map<string, Promise<boolean>>();
+ 
++const agentConfigurationPauses = new Map<string, Map<string, Session>>();
++/** Block new spawns while an idle configuration handoff commits. Mail stays in its inbox. */
++export function beginAgentConfiguration(agentId: string) {
++  if (agentConfigurationPauses.has(agentId)) return undefined;
++  const deferred = new Map<string, Session>();
++  agentConfigurationPauses.set(agentId, deferred);
++  let released = false;
++  return {
++    async settle(sessionIds: string[]) { await Promise.all(sessionIds.map(id => wakePromises.get(id))); },
++    release() {
++      if (released) return;
++      released = true;
++      agentConfigurationPauses.delete(agentId);
++      for (const session of deferred.values()) void getSession(session.id).then(current => {
++        if (current?.status === 'active') return wakeContainer(current);
++      }).catch(err => log.warn('Deferred configuration wake failed; sweep will retry', {sessionId:session.id,err}));
++    },
++  };
++}
++
++
+ /**
+  * Sweep-run deferred-adoption retries in flight, keyed by session id (see
+  * `retryPendingAdoptions`). Resolves false when the retry failed.
+@@ -287,7 +311,7 @@ export function _resetAdoptionRetryStateForTesting(): void {
+  * container, or one the gateway cannot adopt, is stopped.
+  */
+ async function retryPendingAdoption(sessionId: string): Promise<boolean> {
+-  const driver = getSessionDriver();
++  const driver = getSessionDriver((await getSession(sessionId))?.runtime_driver);
+   const snapshots = await driver.listSessions(INSTALL_SLUG);
+   const snapshot = snapshots.find(({ handle, phase }) => handle.key.sessionId === sessionId && phase === 'running');
+   if (!snapshot) {
+@@ -388,6 +412,12 @@ async function retryPendingAdoption(sessionId: string): Promise<boolean> {
+  * next tick.
+  */
+ export function wakeContainer(session: Session): Promise<boolean> {
++  const configurationPause = agentConfigurationPauses.get(session.agent_group_id);
++  if (configurationPause) {
++    configurationPause.set(session.id, session);
++    return Promise.resolve(false);
++  }
++
+   // The sweep is re-fencing this session's survivor (checked first: it may be
+   // registered and mid-stop). Once it settles cleanly, wake again from a fresh
+   // read, so a container it stopped or found gone is replaced now, not a tick
+@@ -428,6 +458,8 @@ export function wakeContainer(session: Session): Promise<boolean> {
+ }
+ 
+ async function spawnContainer(session: Session): Promise<void> {
++  if (await getDb().get("SELECT id FROM execution_transitions WHERE session_id=? AND state!='complete'", session.id))
++    throw new Error('Execution permission change is awaiting verified cleanup');
+   if (pendingAdoptions.has(session.id)) {
+     // A running container is waiting to be re-fenced after a failed adoption
+     // claim. Reclaim it rather than spawning a duplicate; its poll loop picks
+@@ -436,6 +468,11 @@ async function spawnContainer(session: Session): Promise<void> {
+     // The retry stops a closed session's survivor; never respawn it from a stale snapshot.
+     if ((await getSession(session.id))?.status !== 'active') return;
+   }
++  // Callers may carry a snapshot from before an unused session changed backend.
++  // Admit execution and reload the backend under the same database transaction.
++  const current = await recordSessionActivity(session.id);
++  if (!current || current.status !== 'active') return;
++  session = current;
+   const agentGroup = await getAgentGroup(session.agent_group_id);
+   if (!agentGroup) {
+     log.error('Agent group not found', { agentGroupId: session.agent_group_id });
+@@ -457,7 +494,10 @@ async function spawnContainer(session: Session): Promise<void> {
+   // Materialize container.json from DB — writes fresh file and returns
+   // the config object, threaded through provider resolution, buildMounts,
+   // and buildContainerArgs so we don't re-read.
+-  const containerConfig = await materializeContainerJson(agentGroup.id);
++  const containerConfig = await sessionWorkspaceConfiguration(session, await materializeContainerJson(agentGroup.id));
++  const sessionConfigPath = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.context', `${session.id}.container.json`);
++  fs.mkdirSync(path.dirname(sessionConfigPath), { recursive: true, mode: 0o700 });
++  fs.writeFileSync(sessionConfigPath, JSON.stringify(containerConfig), { mode: 0o600 });
+ 
+   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
+   await initGroupFilesystem(agentGroup, { provider: providerName });
+@@ -468,14 +508,17 @@ async function spawnContainer(session: Session): Promise<void> {
+   const { provider, contribution, surfaces } = await resolveProviderContribution(session, agentGroup, containerConfig);
+ 
+   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
+-  const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, surfaces);
++  const driver = getSessionDriver(session.runtime_driver);
++  const mounts = driver.capabilities().nativeProcesses ? [] : await buildMounts(agentGroup, session, containerConfig, provider, contribution, surfaces);
+   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
+ 
+-  const driver = getSessionDriver();
+   // Core calls the same idempotent provider operation for new and surviving
+   // sessions. The returned typed contribution enters driver validation whole.
+   const gatewaySession = await ensureGatewaySession({
+     disposition: 'create',
++    ...(driver.capabilities().nativeProcesses
++      ? { nativePaths: { home: nativeAgentHome(agentGroup.folder), tmp: nativePaths(session.id).tmp } }
++      : {}),
+     key: { installSlug: INSTALL_SLUG, agentGroupId: agentGroup.id, sessionId: session.id },
+     runtimeIdentity: gatewayRuntimeIdentity({
+       installSlug: INSTALL_SLUG,
+@@ -501,7 +544,7 @@ async function spawnContainer(session: Session): Promise<void> {
+       );
+     }
+ 
+-    spec = composeSessionSpec({
++    const composition = {
+       agentGroup,
+       session,
+       containerName,
+@@ -510,7 +553,8 @@ async function spawnContainer(session: Session): Promise<void> {
+       contribution,
+       gateway,
+       mailboxEnvironment,
+-    });
++    };
++    spec = driver.capabilities().nativeProcesses ? await composeNativeSession(composition, selectedSkillNames(containerConfig)) : composeSessionSpec(composition);
+ 
+     log.info('Spawning session', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
+ 
+@@ -645,7 +689,7 @@ async function stopIfOffNetworkPolicy(sessionId: string, runtime: ActiveSessionR
+   /* eslint-disable no-catch-all/no-catch-all -- fail closed: a network that cannot be checked is stopped, never kept */
+   try {
+     const access = runtime.gateway.lease.contribution.networkAccess;
+-    if ((await getSessionDriver().reconcileNetworkAccess?.(access, runtime.handle)) !== 'restart') return false;
++    if ((await getSessionDriver((await getSession(sessionId))?.runtime_driver).reconcileNetworkAccess?.(access, runtime.handle)) !== 'restart') return false;
+     reason = 'network-policy-changed';
+     log.warn('Stopping adopted session: it is not on the network the current policy requires', {
+       sessionId,
+@@ -898,10 +942,12 @@ export function killContainer(sessionId: string, reason: string, onExit?: () =>
+  * session's egress keeps working without any per-process state to rebuild.
+  */
+ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped: number }> {
+-  const driver = getSessionDriver();
+-  let snapshots: SupervisedSnapshot[];
++  const kinds = await getDb().all<{runtime_driver:string}>('SELECT DISTINCT runtime_driver FROM sessions WHERE runtime_driver IS NOT NULL');
++  const drivers = [...new Set([installationRuntime(), ...kinds.map(row => row.runtime_driver)])].map(kind => getSessionDriver(kind));
++  let snapshots: Array<SupervisedSnapshot & {driver:ReturnType<typeof getSessionDriver>}>;
+   try {
+-    snapshots = await driver.listSessions(INSTALL_SLUG);
++    snapshots = [];
++    for (const driver of drivers) snapshots.push(...(await driver.listSessions(INSTALL_SLUG)).map(s => ({...s,driver})));
+   } catch (err) {
+     log.warn('Failed to list existing sessions for adoption', { err });
+     return { adopted: 0, stopped: 0 };
+@@ -909,7 +955,7 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
+ 
+   let adopted = 0;
+   let stopped = 0;
+-  for (const { handle, phase } of snapshots) {
++  for (const { handle, phase, driver } of snapshots) {
+     const session = handle.key.sessionId ? await getSession(handle.key.sessionId) : undefined;
+     const agentGroup = session ? await getAgentGroup(session.agent_group_id) : undefined;
+     // The snapshot's phase is the listing's own truth: a corpse arrives as
+@@ -983,11 +1029,11 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
+   }
+ 
+   await getGatewayProvider().sessions.reapOrphans?.();
+-  await driver.reapResidue?.(INSTALL_SLUG).catch?.(() => {});
++  for (const driver of drivers) await driver.reapResidue?.(INSTALL_SLUG);
+   // Reconcile terminals the watch stream missed while no host was listening —
+   // adoption is the one place a full re-list is already cheap, so the hub's
+   // resync wires here rather than into new periodic machinery.
+-  if (isSessionEventsDriver(driver)) await driver.resync(INSTALL_SLUG).catch(() => {});
++  for (const driver of drivers) if (isSessionEventsDriver(driver)) await driver.resync(INSTALL_SLUG);
+ 
+   if (adopted > 0 || stopped > 0) {
+     log.info('Reconciled sessions at startup', { adopted, stopped });
+@@ -1133,6 +1179,7 @@ export async function resolveProviderContribution(
+     groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
+     selectedSkills: selectedSkillNames(containerConfig),
+     hostEnv: process.env,
++    model: containerConfig.model,
+   };
+   if (!contract) return { provider, contribution: fn ? await fn(context) : {} };
+   if (contract.legacyHostAdapter === 'required' && !fn) {
+@@ -1226,7 +1273,8 @@ export async function buildMounts(
+   // read its config but cannot modify it. Composed per group, so 'group-state'
+   // read-only rather than 'install-surface': the install-surface rule is an
+   // enumerated release-surface allowlist, and this path is under the group.
+-  const containerJsonPath = path.join(groupDir, 'container.json');
++  const sessionConfigPath = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.context', `${session.id}.container.json`);
++  const containerJsonPath = fs.existsSync(sessionConfigPath) ? sessionConfigPath : path.join(groupDir, 'container.json');
+   if (fs.existsSync(containerJsonPath)) {
+     mounts.push({
+       hostPath: containerJsonPath,
+@@ -1569,24 +1617,6 @@ export function syncSkillSymlinks(
+   return selected;
+ }
+ 
+-/**
+- * Resolve the group's skill selection to concrete names — `'all'` recomputes
+- * from `container/skills/` so newly-added upstream skills appear automatically.
+- */
+-function selectedSkillNames(containerConfig: import('./container-config.js').ContainerConfig): string[] {
+-  const sharedSkillsDir = path.join(process.cwd(), 'container', 'skills');
+-  const available = fs.existsSync(sharedSkillsDir)
+-    ? fs.readdirSync(sharedSkillsDir).filter((e) => {
+-        try {
+-          return fs.statSync(path.join(sharedSkillsDir, e)).isDirectory();
+-        } catch {
+-          return false;
+-        }
+-      })
+-    : [];
+-  const selected = containerConfig.skills === 'all' ? available : containerConfig.skills;
+-  return selectGatewayAgentSkills(selected);
+-}
+ 
+ const execAsync = promisify(exec);
+ 
+@@ -1606,7 +1636,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void>
+   // Image building is not on the runtime path (drivers never build) and shells
+   // the local Docker daemon. Both call sites gate on the `imageBuild`
+   // capability; this is the backstop for any future caller that forgets.
+-  if (!getSessionDriver().capabilities().imageBuild) {
++  if (!getSessionDriver(configRow.runtime_driver).capabilities().imageBuild) {
+     throw new Error('Per-agent-group image builds are unavailable on this runtime driver');
+   }
+ 
+diff --git a/src/db/migrations/index.ts b/src/db/migrations/index.ts
+index 0e41129..65b89e5 100644
+--- a/src/db/migrations/index.ts
++++ b/src/db/migrations/index.ts
+@@ -1,3 +1,4 @@
++import { migration027 } from './027-execution-transitions.js';
+ import type Database from 'better-sqlite3';
+ 
+ import { log } from '../../log.js';
+@@ -26,6 +27,7 @@ import { migration022 } from './022-messaging-group-detached.js';
+ import { migration023 } from './023-approvals-instance.js';
+ import { migration024 } from './024-host-coordination.js';
+ import { migration025 } from './025-container-config-speed.js';
++import { migration026 } from './026-execution.js';
+ 
+ interface MigrationBase {
+   version: number;
+@@ -93,6 +95,8 @@ export const migrations: Migration[] = [
+   migration023,
+   migration024,
+   migration025,
++  migration026,
++  migration027,
+ ];
+ 
+ /**
+diff --git a/src/db/sessions.ts b/src/db/sessions.ts
+index af4551e..a03f66b 100644
+--- a/src/db/sessions.ts
++++ b/src/db/sessions.ts
+@@ -1,18 +1,29 @@
+ import type { PendingApproval, PendingQuestion, Session } from '../types.js';
+ import { getDb, hasTable } from './connection.js';
++import { agentRuntime } from '../execution/runtime.js';
+ 
+ // ── Sessions ──
+ 
+ export const TASKS_SYSTEM_THREAD_ID = 'system:tasks';
+ 
+ export async function createSession(session: Session): Promise<void> {
++  session.runtime_driver ??= await agentRuntime(getDb(), session.agent_group_id);
+   await getDb().run(
+-    `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
+-       VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
++    `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at, runtime_driver)
++       VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at, @runtime_driver)`,
+     session,
+   );
+ }
+ 
++/** Admit activity before touching the mailbox or preparing a runner. The update
++ * serializes against backend changes, and the read returns its committed choice. */
++export async function recordSessionActivity(id: string): Promise<Session | undefined> {
++  return getDb().transaction(async () => {
++    await getDb().run('UPDATE sessions SET last_active=? WHERE id=?', new Date().toISOString(), id);
++    return getSession(id);
++  });
++}
++
+ export async function getSession(id: string): Promise<Session | undefined> {
+   return getDb().get<Session>('SELECT * FROM sessions WHERE id = ?', id);
+ }
+@@ -65,7 +76,7 @@ export async function findSessionByAgentGroup(agentGroupId: string): Promise<Ses
+     `SELECT * FROM sessions
+        WHERE agent_group_id = ?
+          AND status = 'active'
+-         AND NOT (messaging_group_id IS NULL AND thread_id IS NOT NULL AND thread_id LIKE 'system:%')
++         AND (thread_id IS NULL OR thread_id NOT LIKE 'system:%')
+        ORDER BY created_at DESC
+        LIMIT 1`,
+     agentGroupId,
+diff --git a/src/delivery.ts b/src/delivery.ts
+index 9a41dab..f3a8a1c 100644
+--- a/src/delivery.ts
++++ b/src/delivery.ts
+@@ -286,7 +286,7 @@ async function drainSession(session: Session): Promise<void> {
+   for (const hook of batchPreviewHooks) {
+     try {
+       await hook(
+-        pending.map(({ kind, content }) => ({ kind, content })),
++        pending.map(({ id, kind, content }) => ({ id, kind, content })),
+         session,
+       );
+     } catch (err) {
+@@ -629,7 +629,7 @@ function isUnguardedEntry(entry: DeliveryEntry): entry is Extract<DeliveryEntry,
+ 
+ /** See the batch-preview invocation in the delivery poll for semantics. */
+ type DeliveryBatchPreviewHook = (
+-  batch: Array<{ kind: string; content: string }>,
++  batch: Array<{ id: string; kind: string; content: string }>,
+   session: Session,
+ ) => void | Promise<void>;
+ const batchPreviewHooks: DeliveryBatchPreviewHook[] = [];
+@@ -700,6 +700,12 @@ export function getDeliveryAction(action: string): DeliveryActionHandler | undef
+  */
+ async function handleSystemAction(content: Record<string, unknown>, session: Session): Promise<void> {
+   const action = content.action as string;
++  if (session.runtime_driver === 'native-macos') {
++    const { ExecutionStore } = await import('./execution/store.js');
++    const { toolAllowed } = await import('./execution/policy.js');
++    const policy = (await new ExecutionStore(getDb()).effective(session.agent_group_id,session.id)).policy;
++    if (!toolAllowed(policy,`mcp:nanoclaw:${action === 'execution_access' ? 'request_access' : action}`)) throw new Error(`Denied by execution policy: ${action}`);
++  }
+   log.info('System action from agent', { sessionId: session.id, action });
+ 
+   const registered = getDeliveryAction(action);
+diff --git a/src/drivers/docker-driver.test.ts b/src/drivers/docker-driver.test.ts
+index 7e578a6..9a193be 100644
+--- a/src/drivers/docker-driver.test.ts
++++ b/src/drivers/docker-driver.test.ts
+@@ -815,3 +815,20 @@ it('does not report successful teardown when the Docker daemon refuses removal',
+   cli.responses.unshift({ match: /^(stop|rm|ps) /, throws: new Error('Cannot connect to the Docker daemon') });
+   await expect(handle.stop('shutdown')).rejects.toMatchObject({ kind: 'runtime-unavailable' });
+ });
++
++it('waits for asynchronous auto-removal before confirming a successful stop',async()=>{
++ const handle=await driver().prepare(fixtureSpec());const run=cli.run.bind(cli);let probes=0;
++ vi.spyOn(cli,'run').mockImplementation((args,opts)=>{
++  if(args[0]==='rm')throw Error('removal already in progress');
++  if(args[0]==='ps')return ++probes<3?'ncl-spike-s1\n':'';
++  return run(args,opts);
++ });
++ await expect(handle.stop('configuration-change')).resolves.toBeUndefined();expect(probes).toBe(3);
++});
++it('bounds a removal check without declaring a still-present runtime stopped',async()=>{
++ const handle=await driver().prepare(fixtureSpec());const run=cli.run.bind(cli);
++ vi.spyOn(cli,'run').mockImplementation((args,opts)=>{
++  if(args[0]==='rm')throw Error('removal refused');if(args[0]==='ps')return 'ncl-spike-s1\n';return run(args,opts);
++ });
++ vi.useFakeTimers();try{const outcome=expect(handle.stop('configuration-change')).rejects.toMatchObject({kind:'unknown'});await vi.advanceTimersByTimeAsync(2100);await outcome;}finally{vi.useRealTimers();}
++});
+diff --git a/src/drivers/docker-driver.ts b/src/drivers/docker-driver.ts
+index b0f66a1..66b066b 100644
+--- a/src/drivers/docker-driver.ts
++++ b/src/drivers/docker-driver.ts
+@@ -609,7 +609,7 @@ class DockerHandle implements SessionHandle {
+     try {
+       this.cli.run(['rm', '--force', this.name]);
+     } catch (error) {
+-      this.#confirmRemoved(this.name, error);
++      await this.#confirmRemoved(this.name, error);
+     }
+     for (const auxiliary of [...this.auxiliaryNames].reverse()) {
+       try {
+@@ -620,7 +620,7 @@ class DockerHandle implements SessionHandle {
+       try {
+         this.cli.run(['rm', '--force', auxiliary]);
+       } catch (error) {
+-        this.#confirmRemoved(auxiliary, error);
++        await this.#confirmRemoved(auxiliary, error);
+       }
+     }
+     if (this.privateNetwork) {
+@@ -633,13 +633,20 @@ class DockerHandle implements SessionHandle {
+   }
+ 
+   /** A successful daemon query distinguishes auto-removal from a daemon outage. */
+-  #confirmRemoved(name: string, error: unknown): void {
+-    try {
+-      const remaining = this.cli.run(['ps', '-a', '--filter', `name=^/${name}$`, '--format', '{{.Names}}']);
+-      if (!remaining.trim()) return;
+-    } catch (probeError) {
+-      throw normalizeDockerError(probeError);
+-    }
++  async #confirmRemoved(name: string, error: unknown): Promise<void> {
++    // --rm cleanup can still be in progress after stop returns. A refused
++    // second removal is not a teardown failure until the daemon keeps listing it.
++    const deadline = Date.now() + 2_000;
++    do {
++      try {
++        const remaining = this.cli.run(['ps', '-a', '--filter', `name=^/${name}$`, '--format', '{{.Names}}']);
++        if (!remaining.trim()) return;
++      } catch (probeError) {
++        throw normalizeDockerError(probeError);
++      }
++      if (Date.now() >= deadline) break;
++      await new Promise(resolve => setTimeout(resolve, 50));
++    } while (Date.now() <= deadline);
+     throw normalizeDockerError(error);
+   }
+ 
+@@ -716,7 +723,7 @@ export function dockerEventToSessionEvent(doc: unknown, installSlug: string): Se
+ export function agentContainerName(spec: Pick<SessionSpec, 'key'>): string {
+   const raw = `${spec.key.installSlug}-${spec.key.sessionId}`.replaceAll(/[^a-zA-Z0-9_.-]/g, '-');
+   if (raw.length <= 48) return `ncl-${raw}`;
+-  const hash = createHash('sha256').update(`${spec.key.installSlug} ${spec.key.sessionId}`).digest('hex').slice(0, 8);
++  const hash = createHash('sha256').update(`${spec.key.installSlug}\u0000${spec.key.sessionId}`).digest('hex').slice(0, 8);
+   return `ncl-${raw.slice(0, 39)}-${hash}`;
+ }
+ 
+diff --git a/src/drivers/index.ts b/src/drivers/index.ts
+index dccd32c..55c55e1 100644
+--- a/src/drivers/index.ts
++++ b/src/drivers/index.ts
+@@ -37,6 +37,7 @@
+  * NanoClaw setting lives.
+  */
+ import os from 'os';
++import { NativeSessionDriver } from './native-driver.js';
+ import path from 'path';
+ 
+ import { DATA_DIR, GROUPS_DIR } from '../config.js';
+@@ -102,6 +103,11 @@ registerSessionDriver(
+     }),
+ );
+ 
++registerSessionDriver('native-macos', () => new NativeSessionDriver(async (key, host, port) => {
++  const { requestNetworkAccess } = await import('../execution/access.js');
++  return requestNetworkAccess(key, host, port);
++}));
++
+ export function configuredDriverKind(env: NodeJS.ProcessEnv = process.env): DriverKind {
+   return readSetting('NANOCLAW_RUNTIME_DRIVER', env).toLowerCase() || DEFAULT_DRIVER_KIND;
+ }
+@@ -140,8 +146,14 @@ export function mountPolicy(env: NodeJS.ProcessEnv = process.env): MountPolicy {
+ }
+ 
+ let installed: SessionEventsDriver | null = null;
++const additionalDrivers = new Map<string, SessionEventsDriver>();
+ 
+-export function getSessionDriver(): SessionEventsDriver {
++export function getSessionDriver(kind?: string | null): SessionEventsDriver {
++  if (kind && kind !== configuredDriverKind()) {
++    let driver = additionalDrivers.get(kind);
++    if (!driver) { driver = createSessionDriver(kind); additionalDrivers.set(kind, driver); }
++    return driver;
++  }
+   if (!installed) installed = createSessionDriver(configuredDriverKind());
+   return installed;
+ }
+@@ -183,8 +195,11 @@ export function resetSessionDriver(next: SessionDriver | null = null): void {
+   // Tests may inject raw fakes; the probe (isSessionEventsDriver) guards resync,
+   // and fake handles carry their own onTerminal where flows need it.
+   installed = next as SessionEventsDriver | null;
++  additionalDrivers.clear();
+ }
+ 
+ export * from './driver-registry.js';
+ export * from './session-events.js';
+ export * from './types.js';
++
++export function activeSessionDrivers(): SessionEventsDriver[] { return [...new Set([getSessionDriver(), ...additionalDrivers.values()])]; }
+diff --git a/src/drivers/types.ts b/src/drivers/types.ts
+index c6a6d49..373bfd6 100644
+--- a/src/drivers/types.ts
++++ b/src/drivers/types.ts
+@@ -129,6 +129,7 @@ export interface NetworkAccessIntent {
+ }
+ 
+ export interface SessionSpec {
++  native?: import('../execution/types.js').NativeProcessSpec;
+   key: SessionKey;
+   /** Lineage labels (channel id, container instance id, ...). Drivers stamp these onto every runtime object. */
+   labels: Record<string, string>;
+@@ -146,7 +147,7 @@ export interface SessionSpec {
+   /** Named, versioned posture. Drivers map it; raw flags never cross the seam. */
+   hardening: 'standard';
+   resources: SessionResources;
+-  runtimeTier: 'container' | 'vm';
++  runtimeTier: 'container' | 'vm' | 'native';
+   /**
+    * uid:gid the containers run as. Docker papers over an image/host uid mismatch
+    * with `--user`; not every realization has such a default, so the identity
+@@ -263,7 +264,8 @@ export interface SessionHandle {
+ export type NetworkReconcile = 'kept' | 'restart';
+ 
+ export interface DriverCapabilities {
+-  isolationTiers: ('container' | 'vm')[];
++  isolationTiers: ('container' | 'vm' | 'native')[];
++  nativeProcesses?: boolean;
+   admissionEnforced: boolean;
+   networkPolicy: 'topology' | 'declarative';
+   encryptedVolumes: boolean;
+diff --git a/src/gateway-approval-coordinator.ts b/src/gateway-approval-coordinator.ts
+index 5050d8b..9d1dfda 100644
+--- a/src/gateway-approval-coordinator.ts
++++ b/src/gateway-approval-coordinator.ts
+@@ -1,3 +1,4 @@
++import { isOperatorResponse } from './response-registry.js';
+ import { gatewayApprovalPresentation } from './gateway-approval-presentation.js';
+ import { permitsConfiguredGatewayRead, permitsUncredentialedGatewayRead } from './gateway-read-policy.js';
+ import { getContainerConfig } from './db/container-configs.js';
+@@ -547,7 +548,7 @@ export async function handleGatewayApprovalResponse(payload: ResponsePayload): P
+     state = pending.get(payload.questionId);
+     if (!(await isAuthorizedApprovalClick(approval, payload))) return true;
+     if (
+-      approvalSource?.durable &&
++      !isOperatorResponse(payload) && approvalSource?.durable &&
+       (payload.instance !== (approval.instance ?? approval.channel_type) ||
+         payload.channelType !== approval.channel_type ||
+         (payload.messageId !== undefined && payload.messageId !== approval.platform_message_id) ||
+diff --git a/src/gateway-providers/gateway-provider-registry.ts b/src/gateway-providers/gateway-provider-registry.ts
+index 1da659b..ddf4a9d 100644
+--- a/src/gateway-providers/gateway-provider-registry.ts
++++ b/src/gateway-providers/gateway-provider-registry.ts
+@@ -15,6 +15,10 @@ import type {
+ 
+ /** Typed spec content contributed to one session. Raw runtime flags never cross this seam. */
+ export interface GatewayContribution {
++  nativeProxy?: {http:string; https:string};
++  nativeReadonly?: string[];
++  /** Copy public trust/stub files only after the native sandbox is active. */
++  nativeFiles?: Array<{ source: string; target: string }>;
+   env?: Record<string, string>;
+   mounts?: MountSpec[];
+   containers?: ContainerSpec[];
+@@ -25,6 +29,7 @@ export interface GatewayContribution {
+ }
+ 
+ export interface GatewaySessionInput {
++  nativePaths?: {home:string;tmp:string};
+   key: SessionKey;
+   /** Adoption must never provision replacement identity for a surviving runtime. */
+   disposition?: 'create' | 'adopt';
+diff --git a/src/mailbox/sqlite/index.ts b/src/mailbox/sqlite/index.ts
+index 5810720..8c81592 100644
+--- a/src/mailbox/sqlite/index.ts
++++ b/src/mailbox/sqlite/index.ts
+@@ -174,6 +174,10 @@ function getTaskStats(db: Database.Database, seriesId: string): TaskStats {
+ 
+ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => nextEvenAcross(db)): InboundMailbox {
+   return {
++    getWorkspaceMessage: (id) => db.prepare('SELECT id,seq,timestamp,kind,content,channel_type,status FROM messages_in WHERE id=?').get(id) as import('../types.js').WorkspaceMailboxMessage | undefined,
++    setWorkspaceContext: (value) => db.prepare('INSERT INTO workspace_context (id,value) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(value),
++    setWorkspaceControl: (control) => db.prepare("INSERT INTO workspace_context (id,value,control) VALUES (1,'{}',?) ON CONFLICT(id) DO UPDATE SET control=excluded.control").run(control),
++    getWorkspaceInbound: (after, limit) => db.prepare('SELECT id,seq,timestamp,kind,content,channel_type,status FROM messages_in WHERE seq>? ORDER BY seq LIMIT ?').all(after, limit) as import('../types.js').WorkspaceMailboxMessage[],
+     setRouting: (routing) => {
+       const record = parseSessionRoutingRecord(routing);
+       upsertSessionRouting(db, {
+@@ -311,6 +315,13 @@ export function wrapSqliteOutbound(
+ ): OutboundMailbox {
+   const readable = () => (typeof source === 'function' ? source() : source);
+   return {
++    getWorkspaceState: (key) => (readable().prepare('SELECT value FROM session_state WHERE key=?').get(key) as { value: string } | undefined)?.value ?? null,
++    getWorkspaceOutbound: (after, limit) => readable().prepare('SELECT id,seq,timestamp,kind,content,channel_type FROM messages_out WHERE seq>? ORDER BY seq LIMIT ?').all(after, limit) as import('../types.js').WorkspaceMailboxMessage[],
++    getWorkspaceEvents: (after, limit) => {
++      const db = readable();
++      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='workspace_events' AND type='table'").get()) return [];
++      return db.prepare('SELECT seq,timestamp,kind,content FROM workspace_events WHERE seq>? ORDER BY seq LIMIT ?').all(after, limit) as import('../types.js').WorkspaceMailboxEvent[];
++    },
+     getTerminalProcessingAcks: () =>
+       (
+         readable()
+@@ -471,6 +482,7 @@ export class SqliteAgentMailbox implements AgentMailbox {
+     try {
+       if (!this.migrated.has(inboundPath)) {
+         migrateMessagesInTable(inbound);
++        inbound.exec('CREATE TABLE IF NOT EXISTS workspace_context (id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL,control TEXT)');
+         const deliveredColumns = inbound.prepare("PRAGMA table_info('delivered')").all();
+         if (deliveredColumns.length > 0) migrateDeliveredTable(inbound);
+         this.migrated.add(inboundPath);
+diff --git a/src/mailbox/sqlite/schema.ts b/src/mailbox/sqlite/schema.ts
+index dbbb999..a090ef0 100644
+--- a/src/mailbox/sqlite/schema.ts
++++ b/src/mailbox/sqlite/schema.ts
+@@ -1,5 +1,6 @@
+ /** Host-owned SQLite mailbox schema. */
+ export const INBOUND_SCHEMA = `
++CREATE TABLE IF NOT EXISTS workspace_context (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL, control TEXT);
+ CREATE TABLE IF NOT EXISTS messages_in (
+   id             TEXT PRIMARY KEY,
+   seq            INTEGER UNIQUE,
+@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS session_routing (
+ 
+ /** Runner-owned SQLite mailbox schema. */
+ export const OUTBOUND_SCHEMA = `
++CREATE TABLE IF NOT EXISTS workspace_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS messages_out (
+   id             TEXT PRIMARY KEY,
+   seq            INTEGER UNIQUE,
+diff --git a/src/mailbox/types.ts b/src/mailbox/types.ts
+index dbb546b..b7a38c4 100644
+--- a/src/mailbox/types.ts
++++ b/src/mailbox/types.ts
+@@ -90,7 +90,14 @@ export interface MailboxTimelineMessage {
+ }
+ 
+ /** Host-visible inbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
++export interface WorkspaceMailboxMessage { id: string; seq: number; timestamp: string; kind: string; content: string; channel_type: string | null; status?: string; }
++export interface WorkspaceMailboxEvent { seq: number; timestamp: string; kind: string; content: string; }
++
+ export interface InboundMailbox {
++  getWorkspaceMessage?(id: string): WorkspaceMailboxMessage | undefined;
++  setWorkspaceContext?(context: string): void;
++  setWorkspaceControl?(control: string): void;
++  getWorkspaceInbound?(after: number, limit: number): WorkspaceMailboxMessage[];
+   setRouting(routing: SessionRouting): void;
+   replaceDestinations(entries: Destination[]): void;
+   insertMessage(message: InboundMessage): Promise<void>;
+@@ -136,6 +143,9 @@ export interface InboundMailbox {
+ 
+ /** Host-visible outbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
+ export interface OutboundMailbox {
++  getWorkspaceOutbound?(after: number, limit: number): WorkspaceMailboxMessage[];
++  getWorkspaceEvents?(after: number, limit: number): WorkspaceMailboxEvent[];
++  getWorkspaceState?(key: string): string | null;
+   getTerminalProcessingAcks(): ProcessingAck[];
+   getProcessingClaims(): ProcessingClaim[];
+   deleteOrphanProcessingClaims(): number;
+diff --git a/src/modules/approvals/primitive.ts b/src/modules/approvals/primitive.ts
+index a87e937..0bd276e 100644
+--- a/src/modules/approvals/primitive.ts
++++ b/src/modules/approvals/primitive.ts
+@@ -219,6 +219,9 @@ export async function notifyAgent(session: Session, text: string): Promise<void>
+ }
+ 
+ export interface RequestApprovalOptions {
++  options?: RawOption[];
++  expiresAt?: string;
++  requestId?: string;
+   session: Session;
+   agentName: string;
+   /** Free-form action identifier. Must match the key the consumer registered via registerApprovalHandler. */
+@@ -264,10 +267,11 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
+     return;
+   }
+ 
+-  const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+-  const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
++  const approvalId = opts.requestId ?? `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
++  const normalizedOptions = normalizeOptions(opts.options ?? APPROVAL_OPTIONS);
+   await createPendingApproval({
+     approval_id: approvalId,
++    expires_at: opts.expiresAt ?? null,
+     session_id: session.id,
+     request_id: approvalId,
+     action,
+@@ -297,7 +301,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
+           questionId: approvalId,
+           title,
+           question,
+-          options: APPROVAL_OPTIONS,
++          options: opts.options ?? APPROVAL_OPTIONS,
+         }),
+         undefined,
+         target.messagingGroup.instance,
+diff --git a/src/modules/index.ts b/src/modules/index.ts
+index f88885c..5b8f169 100644
+--- a/src/modules/index.ts
++++ b/src/modules/index.ts
+@@ -25,3 +25,9 @@ import './permissions/index.js';
+ import './agent-to-agent/index.js';
+ import './self-mod/index.js';
+ import './community-portal/index.js';
++
++
++import '../execution/access.js';
++import '../execution/access-action.js';
++
++import '../execution/browser-action.js';
+diff --git a/src/modules/interactive/index.ts b/src/modules/interactive/index.ts
+index 8dacfa6..e807a5f 100644
+--- a/src/modules/interactive/index.ts
++++ b/src/modules/interactive/index.ts
+@@ -31,7 +31,7 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
+   }
+ 
+   await writeSessionMessage(session.agent_group_id, session.id, {
+-    id: `qr-${payload.questionId}-${Date.now()}`,
++    id: `qr-${payload.questionId}`,
+     kind: 'system',
+     timestamp: new Date().toISOString(),
+     platformId: pq.platform_id,
+diff --git a/src/modules/mount-security/index.ts b/src/modules/mount-security/index.ts
+index 3549d76..1aa0e72 100644
+--- a/src/modules/mount-security/index.ts
++++ b/src/modules/mount-security/index.ts
+@@ -309,6 +309,14 @@ export interface MountValidationResult {
+  * Validate a single additional mount against the allowlist.
+  * Returns validation result with reason.
+  */
++/** Inspect a proposed root before an operator grants it in the allowlist. */
++export function inspectMountCandidate(hostPath: string): { realPath: string; blocked: string | null } {
++  const realPath = fs.realpathSync(expandPath(hostPath));
++  if (!fs.statSync(realPath).isDirectory()) throw new Error('Mount root must be a directory.');
++  const patterns = loadMountAllowlist()?.blockedPatterns ?? DEFAULT_BLOCKED_PATTERNS;
++  return { realPath, blocked: matchesBlockedPattern(realPath, patterns) };
++}
++
+ export function validateMount(mount: AdditionalMount): MountValidationResult {
+   const allowlist = loadMountAllowlist();
+ 
+diff --git a/src/modules/self-mod/guard.test.ts b/src/modules/self-mod/guard.test.ts
+index ab4e7ed..1b53fed 100644
+--- a/src/modules/self-mod/guard.test.ts
++++ b/src/modules/self-mod/guard.test.ts
+@@ -1,3 +1,5 @@
++import {initTestDb,closeDb} from '../../db/connection.js';
++import {runMigrations} from '../../db/migrations/index.js';
+ /**
+  * Self-mod guard × driver capabilities.
+  *
+@@ -11,7 +13,7 @@
+  * driver ships in this tree, so the incapable polarity is a stub declaring
+  * what an out-of-tree driver (no build daemon on the node) actually declares.
+  */
+-import { afterEach, describe, expect, it, vi } from 'vitest';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ 
+ vi.mock('../../log.js', () => ({
+   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+@@ -87,3 +89,7 @@ describe('add_mcp_server needs no rebuild and must not inherit the gate', () =>
+     expect(decision.effect).toBe('hold');
+   });
+ });
++
++beforeEach(async()=>{await runMigrations(await initTestDb());});
++
++afterEach(async()=>{await closeDb();});
+diff --git a/src/modules/self-mod/guard.ts b/src/modules/self-mod/guard.ts
+index 0a26a25..d7aa574 100644
+--- a/src/modules/self-mod/guard.ts
++++ b/src/modules/self-mod/guard.ts
+@@ -17,6 +17,8 @@
+  * ran on Docker cannot execute after a switch to a driver without
+  * imageBuild. add_mcp_server needs no rebuild and carries no gate.
+  */
++import { getSession } from '../../db/sessions.js';
++import { getContainerConfig } from '../../db/container-configs.js';
+ import { getSessionDriver } from '../../drivers/index.js';
+ import { DENY, HOLD, defineGuardedAction, type GuardInput } from '../../guard/index.js';
+ 
+@@ -34,11 +36,13 @@ const holdInstallPackages = selfModDecide('install_packages');
+ export const selfModInstallPackages = defineGuardedAction({
+   action: 'self_mod.install_packages',
+   grantActionName: 'install_packages',
+-  decide: (input) => {
++  decide: async (input) => {
+     // The capability gate runs first: a deny for "this runtime cannot do it"
+     // must win over a hold even for a request that would otherwise card an
+     // admin. Gate on capabilities(), never on kind (drivers/index.ts).
+-    if (!getSessionDriver().capabilities().imageBuild) {
++    const session = input.actor.kind === 'agent' && input.actor.sessionId ? await getSession(input.actor.sessionId) : undefined;
++    const config = input.actor.kind === 'agent' ? await getContainerConfig(input.actor.agentGroupId) : undefined;
++    if (!getSessionDriver(session?.runtime_driver || config?.runtime_driver).capabilities().imageBuild) {
+       return DENY(
+         "install_packages needs an image rebuild and the session runtime does not declare the 'imageBuild' " +
+           'capability — packages cannot be installed on this runtime (image changes are built and imported out of band)',
+diff --git a/src/project-doc-compose.ts b/src/project-doc-compose.ts
+index be984f9..43aab80 100644
+--- a/src/project-doc-compose.ts
++++ b/src/project-doc-compose.ts
+@@ -1,3 +1,4 @@
++import { InstructionHistory } from './instruction-history.js';
+ /**
+  * Project-document composition for agent groups.
+  *
+@@ -15,7 +16,7 @@
+  * Runs on every container start, so editing a source still reaches every agent
+  * on its next spawn.
+  */
+-import { randomUUID } from 'crypto';
++import { writeAtomic } from './atomic-file.js';
+ import fs from 'fs';
+ import path from 'path';
+ 
+@@ -189,6 +190,7 @@ export async function composeGroupProjectDoc(
+   // The group's standing instructions lead the document, and are never
+   // droppable: a group whose persona is evicted stops being that group.
+   const persona = readGroupPersona(groupDir);
++  new InstructionHistory().observe(group.id, persona ?? '');
+   if (persona) push('Persona', persona);
+ 
+   const legacySpec = spec.baseDocPath !== undefined;
+@@ -248,6 +250,8 @@ export async function composeGroupProjectDoc(
+   const content =
+     spec.maxBytes === undefined ? render(sections) : fitToCap(sections, spec.maxBytes, spec.fileName, group.name);
+   writeAtomic(path.join(groupDir, spec.fileName), content);
++  // Native sessions load mutable identity separately at each turn.
++  writeAtomic(path.join(groupDir, 'instructions.runtime.md'), render(sections.filter(section => section.name !== 'Persona')));
+ }
+ 
+ function block(section: ProjectDocSection): string {
+@@ -322,31 +326,3 @@ function fitToCap(sections: ProjectDocSection[], maxBytes: number, fileName: str
+   }
+   return content;
+ }
+-
+-/**
+- * LOAD-BEARING, both halves. The group directory is mounted read-write at
+- * `/workspace/agent`, so the agent can create entries beside the document the
+- * host is about to write. A predictable temp name (the old `.tmp-<pid>`, and
+- * the host pid is stable for the life of the process) is therefore a path the
+- * agent can pre-plant: a symlink there redirects this write to any file the
+- * host user can reach, and a directory there fails the spawn on every retry.
+- *
+- * The random name means there is nothing to pre-plant; `wx` (O_CREAT|O_EXCL)
+- * refuses an existing path, symlink included, so a lucky guess fails closed;
+- * and the cleanup cannot throw, because a leftover temp file must never be
+- * able to dark a group. Mirrors `migrate-claude-memory-settings.ts`, which
+- * runs once at startup and so can use pid+time where this needs randomness.
+- */
+-function writeAtomic(filePath: string, content: string): void {
+-  const tmp = `${filePath}.tmp-${randomUUID()}`;
+-  try {
+-    fs.writeFileSync(tmp, content, { flag: 'wx' });
+-    fs.renameSync(tmp, filePath);
+-  } finally {
+-    try {
+-      fs.unlinkSync(tmp);
+-    } catch {
+-      // The rename consumed the temp file, or creation failed before it existed.
+-    }
+-  }
+-}
+diff --git a/src/provider-contracts/realize.ts b/src/provider-contracts/realize.ts
+index 38c5197..ba3a2a9 100644
+--- a/src/provider-contracts/realize.ts
++++ b/src/provider-contracts/realize.ts
+@@ -126,7 +126,7 @@ export async function realizeProviderSpawnSurfaces(
+   // contract existed; only its mounts are dropped, since core now realizes
+   // every declared surface. Nothing in the contract switches this on or off.
+   const overlay = await actions.legacyOverlay();
+-  const contribution = overlay.env ? { env: overlay.env } : {};
++  const contribution = { ...(overlay.env ? { env: overlay.env } : {}), ...(overlay.modelEndpoint ? { modelEndpoint: overlay.modelEndpoint } : {}) };
+ 
+   for (const volume of contract.stateVolumes) {
+     const hostPath = providerStateVolumePath(volume, agentGroupId, sessionDirectory);
+diff --git a/src/providers/provider-container-registry.ts b/src/providers/provider-container-registry.ts
+index 8e73ca8..05858a4 100644
+--- a/src/providers/provider-container-registry.ts
++++ b/src/providers/provider-container-registry.ts
+@@ -33,6 +33,7 @@ export interface VolumeMount {
+ export interface ProviderContainerContext {
+   /** Per-session host directory: `<DATA_DIR>/v2-sessions/<session_id>`. */
+   sessionDir: string;
++  model?: string;
+   /** Agent group ID, for any per-group logic. */
+   agentGroupId: string;
+   /**
+@@ -60,6 +61,7 @@ export interface ProviderContainerContext {
+ }
+ 
+ export interface ProviderContainerContribution {
++  modelEndpoint?: string;
+   /** Extra volume mounts (merged with the default session/group/agent-runner mounts). */
+   mounts?: VolumeMount[];
+   /** Extra env vars to pass to the container (`-e KEY=VALUE`). */
+diff --git a/src/response-registry.ts b/src/response-registry.ts
+index 51fbd58..fe064b3 100644
+--- a/src/response-registry.ts
++++ b/src/response-registry.ts
+@@ -35,3 +35,11 @@ export function registerResponseHandler(handler: ResponseHandler, options: { pre
+ export function getResponseHandlers(): readonly ResponseHandler[] {
+   return responseHandlers;
+ }
++
++const operatorResponses = new WeakSet<ResponsePayload>();
++/** Only owner-authenticated host transports mint this proof; JSON cannot forge it. */
++export function markOperatorResponse(payload: ResponsePayload): ResponsePayload {
++  operatorResponses.add(payload);
++  return payload;
++}
++export function isOperatorResponse(payload: ResponsePayload): boolean { return operatorResponses.has(payload); }
+diff --git a/src/session-manager.ts b/src/session-manager.ts
+index ad84b64..728c299 100644
+--- a/src/session-manager.ts
++++ b/src/session-manager.ts
+@@ -6,6 +6,7 @@ import { AsyncLocalStorage } from 'async_hooks';
+ import fs from 'fs';
+ import path from 'path';
+ 
++import { sessionWorkspaceContext } from './session-workspace.js';
+ import { AnchoredDir } from './anchored-dir.js';
+ import { deriveAttachmentName } from './attachment-naming.js';
+ import { inboxFolderName, isSafeAttachmentName } from './attachment-safety.js';
+@@ -20,6 +21,7 @@ import {
+   findSessionByAgentGroup,
+   findSessionForAgent,
+   getSession,
++  recordSessionActivity,
+   taskThreadId,
+   unbindSession,
+   updateSession,
+@@ -108,6 +110,7 @@ export async function resolveSession(
+   messagingGroupId: string | null,
+   threadId: string | null,
+   sessionMode: 'shared' | 'per-thread' | 'agent-shared',
++  runtimeDriver?: string,
+ ): Promise<{ session: Session; created: boolean }> {
+   const key = sessionCreationKey(agentGroupId, messagingGroupId, threadId, sessionMode);
+   return withSessionCreationLock(key, async () => {
+@@ -149,6 +152,7 @@ export async function resolveSession(
+       messaging_group_id: messagingGroupId,
+       thread_id: lookupThreadId,
+       agent_provider: null,
++      runtime_driver: runtimeDriver,
+       status: 'active',
+       container_status: 'stopped',
+       last_active: null,
+@@ -311,8 +315,12 @@ export async function writeSessionMessage(
+ 
+   // Extract base64 attachment data, save to inbox, replace with file paths
+   const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
++  const workspaceContext = await sessionWorkspaceContext(sessionId);
+ 
++  // Lock the runtime before mail becomes visible to any runner or sweep.
++  await recordSessionActivity(sessionId);
+   await withMailboxSession(agentGroupId, sessionId, async (mailbox) => {
++    if (workspaceContext !== undefined) mailbox.setWorkspaceContext?.(workspaceContext);
+     await mailbox.insertMessage({
+       id: message.id,
+       kind: message.kind,
+@@ -328,6 +336,8 @@ export async function writeSessionMessage(
+       onWake: message.onWake ?? false,
+     });
+   });
++  // Preserve the completion stamp after mail lands (the target may be deleted
++  // while insertion is in flight; routing rechecks that lifecycle boundary).
+   await updateSession(sessionId, { last_active: new Date().toISOString() });
+   // Ask for a prompt reconcile now that the message is durable: a wake that
+   // fails transiently is retried within the queue's cadence instead of
+diff --git a/src/types.ts b/src/types.ts
+index ade18b1..b2579fd 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -20,6 +20,7 @@ export type ContainerSpeed = string;
+ /** Per-agent-group container runtime config. Source of truth in the DB;
+  *  materialized to `groups/<folder>/container.json` at spawn time. */
+ export interface ContainerConfigRow {
++  runtime_driver?: string | null;
+   agent_group_id: string;
+   provider: string | null;
+   model: string | null;
+@@ -163,6 +164,7 @@ export interface MessagingGroupAgent {
+ }
+ 
+ export interface Session {
++  runtime_driver?: string | null;
+   id: string;
+   agent_group_id: string;
+   messaging_group_id: string | null;
