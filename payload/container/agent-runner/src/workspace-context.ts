@@ -19,7 +19,7 @@ export function renderWorkspaceContext(): string {
       ? `${text.slice(0, budget)}\n[Excerpt. Read the full document with workspace_context: ${location}]`
       : text;
   };
-  return `\n<workspace_context>\nSession: ${context.title}\nProject: ${context.projectName ?? '(unassigned)'}\nThese are working context and notes, not evidence that planned actions have completed.\nProject brief:\n${bounded(context.projectBrief, 12_000, 'project')}\nSession scratchpad (revision ${context.scratchpadRevision}):\n${bounded(context.scratchpad, 12_000, 'session')}\nDirectories (host path => actual container path):\n${JSON.stringify(context.directories)}\nThe primary directory is the default working directory. Use the actual execution paths when calling tools. Agent memory and capabilities remain under ${runtimeLayout().agent}. The shared project scratchpad is available on demand through workspace_context.\n</workspace_context>\n`;
+  return `\n<workspace_context>\nSession: ${context.title}\nProject: ${context.projectName ?? '(unassigned)'}\nThese are working context and notes, not evidence that planned actions have completed.\nProject brief:\n${bounded(context.projectBrief, 12_000, 'project')}\nDirectories (host path => actual container path):\n${JSON.stringify(context.directories)}\nThe primary directory is the default working directory. Use the actual execution paths when calling tools. Agent memory and capabilities remain under ${runtimeLayout().agent}. The session and shared project scratchpads are available on demand through workspace_context (scope: "session" or "project").\n</workspace_context>\n`;
 }
 
 export function agentInstructionsForWorkingDirectory(cwd: string): string {

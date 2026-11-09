@@ -29,14 +29,19 @@ beforeEach(() => {
     );
 });
 afterEach(closeSessionDb);
-it('reads fresh host context through the real mailbox without injecting the project scratchpad', () => {
+it('keeps both scratchpads available through the real mailbox without injecting their contents', () => {
   expect(readWorkspaceContext()?.scratchpadRevision).toBe(4);
   const text = renderWorkspaceContext();
-  expect(text).toContain('Decision B');
+  expect(readWorkspaceContext()?.scratchpad).toBe('Decision B');
+  expect(readWorkspaceContext()?.projectScratchpad).toBe('Full project notes on demand');
+  expect(text).toContain('Build it');
+  expect(text).toContain('scope: "session" or "project"');
+  expect(text).not.toContain('Decision B');
   expect(text).toContain('/workspace/extra/ws-repo');
   expect(text).not.toContain('Full project notes on demand');
   db.inbound.query('UPDATE workspace_context SET value=?').run(JSON.stringify({ scratchpad: 'Human correction C' }));
-  expect(renderWorkspaceContext()).toContain('Human correction C');
+  expect(readWorkspaceContext()?.scratchpad).toBe('Human correction C');
+  expect(renderWorkspaceContext()).not.toContain('Human correction C');
 });
 it('writes redacted tool activity and acknowledges the specific reconfigure request', () => {
   emitWorkspaceEvent('tool', {
